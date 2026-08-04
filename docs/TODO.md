@@ -24,6 +24,15 @@ Bevy 0.19 BMS 铺面播放器 — 未完成事项清单。
 
 ## 优先级 P1（功能补全）
 
+- [ ] **重新设计 Lua API（去 beatoraja 化）**
+  - 现状：皮肤描述语言与运行时 API（`main_state`、timer 模型、`SkinSourceImageSet`
+    语义、destination/object 约定）整体移植自 beatoraja `Skin` 体系
+    （`src/skin/lua.rs` / `model.rs` / `state.rs` / `render.rs` / `runtime.rs`）
+  - 目标：按 rxbms 自身需求重新设计——更清晰的描述语法、精简/重构 `main_state`
+    接口、独立的对象/动画/文本/图形模型；旧皮肤（beatoraja 格式）不承诺兼容，
+    以可维护性与可扩展性为优先
+  - 范围：描述表解析 → 运行时状态 → 渲染求值全链路；涉及 skin 模块五个文件
+
 - [ ] **结算界面 / 游玩记录**（`src/result.rs` / `src/record.rs` 空壳）
   - 结算：EX 分数、判定计数、血量结果、失败/通过展示（走皮肤或 UI）
   - 记录：`songs.db` 或独立表保存游玩历史（成绩、判定、时间）
