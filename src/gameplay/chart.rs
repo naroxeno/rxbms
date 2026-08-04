@@ -266,6 +266,26 @@ fn lane_order(key: Key) -> (u8, u8) {
         set
     }
 
+    /// BGM 事件引用统计：wav 路径 → 事件次数。
+    ///
+    /// 事件次数用于判断 BGM 通道文件的播放形态：**密集引用**（同一文件被大量
+    /// BGM 事件触发，如循环采样）必须走静态缓存多路并发，否则每次事件停旧流+
+    /// 重开流会把背景音掐断；**稀疏引用**（1-2 次）才是真正的分段长 BGM，
+    /// 适合流式解码。
+    #[must_use]
+    pub fn bgm_audio_stats(&self) -> std::collections::HashMap<PathBuf, usize> {
+        let mut stats = std::collections::HashMap::new();
+        let all = self.chart.events().events_in_y_range(YCoordinate::ZERO..);
+        for pe in &all {
+            if let ChartEvent::Bgm { wav_id: Some(id) } = &pe.event
+                && let Some(p) = self.wav_paths.get(id)
+            {
+                *stats.entry(p.clone()).or_insert(0) += 1;
+            }
+        }
+        stats
+    }
+
     /// 游玩模式：按谱面使用的最大键号判断（≤5 → 5K，否则 7K）。
     #[must_use]
     pub fn play_mode(&self) -> crate::core::keybind::PlayMode {
@@ -908,3 +928,9 @@ mod tests {
         );
     }
 }
+
+
+
+
+
+

@@ -13,7 +13,7 @@ use std::{
     collections::{HashMap, VecDeque},
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc, Arc,
     },
 };
@@ -75,6 +75,8 @@ pub struct BgaPlayer {
     frame_image: Handle<Image>,
     /// 当前视频流（后台线程解码）。
     video: Option<VideoStream>,
+    /// 当前视频帧尺寸（descriptor 只在尺寸变化时更新，避免纹理重建卡顿）。
+    video_size: Option<(u32, u32)>,
     /// 当前 BGA 图像（供皮肤渲染）：静态图 handle 或视频帧 handle。
     current_image: Option<Handle<Image>>,
 }
@@ -101,6 +103,7 @@ impl BgaPlayer {
             images: HashMap::new(),
             frame_image,
             video: None,
+            video_size: None,
             current_image: None,
         }
     }
@@ -125,34 +128,42 @@ impl BgaPlayer {
             let ev = self.data.events[self.next_idx];
             self.next_idx += 1;
             if ev.bmp_id != self.current.unwrap_or(usize::MAX) {
-                self.switch_to(ev.bmp_id, asset_server);
+                // 视频从**触发时刻**从头播放（beatoraja restart 校准）
+                self.switch_to(ev.bmp_id, now_sec, asset_server);
             }
         }
 
         // 2. 视频帧推进（写入帧缓冲；皮肤渲染经 current_image 取用）
-        // 时间轴：BGA 视频从谱面开始对应（帧时间 = 谱面时间），保证与音乐同步。
         if let Some(stream) = &mut self.video {
+            stream.set_target(now_sec);
             stream.drain();
             if let Some(f) = stream.frame_at(now_sec)
                 && let Some(mut img) = images.get_mut(&self.frame_image)
             {
                 img.data = Some(f.rgba);
-                img.texture_descriptor.size = Extent3d {
-                    width: f.w,
-                    height: f.h,
-                    depth_or_array_layers: 1,
-                };
-                img.texture_descriptor.format = TextureFormat::Rgba8UnormSrgb;
+                // descriptor 仅在尺寸变化时更新（同尺寸每帧改会触发纹理重建 → 卡顿）
+                if self.video_size != Some((f.w, f.h)) {
+                    img.texture_descriptor.size = Extent3d {
+                        width: f.w,
+                        height: f.h,
+                        depth_or_array_layers: 1,
+                    };
+                    img.texture_descriptor.format = TextureFormat::Rgba8UnormSrgb;
+                    self.video_size = Some((f.w, f.h));
+                }
             }
             // 解码未到达或已播完 → 保持上一帧
         }
     }
 
     /// 切换到指定 BmpId：图片 / 视频 / 无资源 → 更新当前图像。
-    fn switch_to(&mut self, bmp_id: usize, asset_server: &AssetServer) {
+    ///
+    /// `trigger_sec`：视频触发时刻（谱面时间），视频从此刻从头播放。
+    fn switch_to(&mut self, bmp_id: usize, trigger_sec: f64, asset_server: &AssetServer) {
         self.current = Some(bmp_id);
         // 停止旧视频
         self.video = None;
+        self.video_size = None;
 
         if let Some(path) = self.data.images.get(&bmp_id) {
             // 静态图：懒加载，设为当前图像
@@ -164,7 +175,7 @@ impl BgaPlayer {
             self.current_image = Some(handle);
         } else if let Some(path) = self.data.videos.get(&bmp_id) {
             // 视频：启动后台解码线程，当前图像 = 帧缓冲
-            match VideoStream::start(path) {
+            match VideoStream::start(path, trigger_sec) {
                 Ok(video) => {
                     self.video = Some(video);
                     self.current_image = Some(self.frame_image.clone());
@@ -190,13 +201,18 @@ struct VideoFrame {
     rgba: Vec<u8>,
 }
 
-/// 视频流：**专用后台线程**持续顺序解码（尽力而为），主线程按谱面时间取帧。
+/// 视频流：**专用后台线程**持续顺序解码，主线程按谱面时间取帧。
 ///
-/// 解码不再占用主线程（软解 wmv 每帧 5-20ms，主线程解码会拖垮帧率 → 视频越播越慢）。
-/// 帧带时间戳进入缓冲，主线程选 `sec <= 谱面时间` 的最近一帧显示。
+/// 时间模型（beatoraja）：视频从**触发时刻**从头播放，
+/// `offset = 首帧时间戳 − 触发时刻`，目标帧 = 谱面时间 + offset。
+/// 解码按目标时间节流（超前 sleep，不积压），主线程零解码。
 struct VideoStream {
     rx: mpsc::Receiver<Option<VideoFrame>>,
     stop: Arc<AtomicBool>,
+    /// 目标帧时间偏移（秒）：帧选择用 `sec <= 谱面时间 + offset`。
+    offset: f64,
+    /// 当前谱面时间（主线程写入，解码线程节流读取；纳秒）。
+    target_ns: Arc<AtomicU64>,
     /// 已解码但未消费的帧（按 sec 升序，限长）。
     frames: VecDeque<VideoFrame>,
     /// 是否已收到 EOF。
@@ -208,13 +224,19 @@ const VIDEO_BUFFER_MAX: usize = 16;
 
 impl VideoStream {
     /// 打开视频并启动后台解码线程。
-    fn start(path: &Path) -> Result<Self, String> {
+    ///
+    /// `trigger_sec`：该视频首次触发的谱面时间（beatoraja `restart()` 校准基准）。
+    fn start(path: &Path, trigger_sec: f64) -> Result<Self, String> {
         let (tx, rx) = mpsc::channel();
         let stop = Arc::new(AtomicBool::new(false));
         let stop2 = stop.clone();
+        let target_ns = Arc::new(AtomicU64::new((trigger_sec * 1e9) as u64));
+        let target_ns2 = target_ns.clone();
         // Box 包裹：避免 Rust 2021 闭包字段级捕获（disjoint capture）把非 Send 的
         // scaler 字段单独捕获进线程（整个 BgaVideo 有 unsafe impl Send，字段没有）。
         let mut video = Box::new(BgaVideo::open(path)?);
+        // beatoraja：`offset = grabber.getTimestamp() − time*1000`（首帧时间戳 − 触发时刻）
+        let offset = video.start_ts - trigger_sec;
         std::thread::Builder::new()
             .name("bga-decode".into())
             .spawn(move || {
@@ -247,6 +269,11 @@ impl VideoStream {
                         if tx.send(Some(f)).is_err() {
                             return; // 接收端已放弃
                         }
+                        // 节流：解码超前目标 0.5s 以上 → 睡一会（跟随谱面时间，不积压）
+                        let target = target_ns2.load(Ordering::Relaxed) as f64 / 1e9;
+                        if sec > target + 0.5 {
+                            std::thread::sleep(std::time::Duration::from_millis(4));
+                        }
                     }
                 }
                 let _ = tx.send(None); // EOF
@@ -255,9 +282,17 @@ impl VideoStream {
         Ok(Self {
             rx,
             stop,
+            offset,
+            target_ns,
             frames: VecDeque::new(),
             eof: false,
         })
+    }
+
+    /// 更新当前谱面时间（解码线程节流基准）。
+    fn set_target(&mut self, now_sec: f64) {
+        self.target_ns
+            .store((now_sec * 1e9) as u64, Ordering::Relaxed);
     }
 
     /// 拉取解码线程已产出的帧到缓冲（非阻塞），限长。
@@ -275,12 +310,13 @@ impl VideoStream {
     }
 
     /// 取 `sec <= target` 的最近一帧（显示它并移除更早的帧）。
-    /// 帧时间戳与谱面时间直接对比（beatoraja：`microtime = time * 1000`，offset≈0）。
+    /// 目标时间含触发偏移（beatoraja：`microtime = time*1000 + offset`）。
     /// 解码尚未到达时返回 `None`（保持上一帧显示）。
     fn frame_at(&mut self, target: f64) -> Option<VideoFrame> {
+        let t = target + self.offset;
         let mut idx = None;
         for (i, f) in self.frames.iter().enumerate() {
-            if f.sec <= target {
+            if f.sec <= t {
                 idx = Some(i);
             } else {
                 break;
@@ -306,6 +342,8 @@ struct BgaVideo {
     stream_index: usize,
     /// 帧时间戳单位（秒/时间戳，取**流的** time_base）。
     time_base: f64,
+    /// 视频首帧时间戳（秒；无 → 0）。
+    start_ts: f64,
     /// 已解码游标（视频内秒）。
     decoded_sec: f64,
 }
@@ -337,6 +375,13 @@ impl BgaVideo {
         } else {
             1.0 / 30.0
         };
+        // 视频首帧时间戳（秒；AV_NOPTS_VALUE/负值 → 0）
+        let start_ts = input.start_time();
+        let start_ts = if start_ts > 0 {
+            start_ts as f64 * time_base
+        } else {
+            0.0
+        };
         let ctx = ffmpeg::codec::context::Context::from_parameters(input.parameters())
             .map_err(|e| format!("解码器上下文失败: {e}"))?;
         let decoder = ctx
@@ -364,6 +409,7 @@ impl BgaVideo {
             scaler,
             stream_index,
             time_base,
+            start_ts,
             decoded_sec: 0.0,
         })
     }

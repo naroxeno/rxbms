@@ -123,17 +123,19 @@ pub(crate) fn setup_gameplay(
         loaded.keysound_event_count
     );
 
-    // 向全局音频管理器请求加载：BGM 优先（少量，就绪即可开玩），键音后台渐进预加载
+    // 向全局音频管理器请求加载：大 BGM 注册为流式（不缓存），其余（键音 +
+    // 密集 BGM 采样）同步解码进缓存。注意：register_bgm 必须在 submit_priority
+    // 之前（优先级加载会跳过流式 BGM 文件）
+    audio.register_bgm(loaded.bgm_audio_stats());
     let paths: Vec<_> = loaded.wav_paths.values().cloned().collect();
     let lease = audio.acquire(&paths);
     let priority = loaded.priority_audio_paths(30.0);
     audio.submit_priority(priority.clone());
     info!(
-        "[gameplay] 首批音频 {}/{}（前 30 秒，就绪即开玩）",
+        "[gameplay] 首批音频 {}/{}（前 30 秒，解码完成即开玩）",
         priority.len(),
         paths.len()
     );
-    audio.submit_priority(priority);
     let reaction = TimeSpan::from_duration(std::time::Duration::from_secs_f64(0.5));
     let visible_range = VisibleRangePerBpm::new(loaded.chart.init_bpm(), reaction);
     let started_at = TimeStamp::now();
@@ -204,7 +206,9 @@ fn tick_gameplay(
         return;
     }
 
-    // 退出等待：等当前 BGM 自然播完再回选曲（超时兜底）
+    // 完成铺面后的退出等待：等当前 BGM 自然播完再回选曲（超时兜底）。
+    // 只有"完成铺面"会进入此分支；中途退出（ESC/失败）已直接释放音频。
+    // 注意：若 BGM 已播完（短于谱面或未触发），下一帧即返回，不强制停留。
     if session.exiting {
         let now = TimeStamp::now();
         let timeout = now
@@ -218,14 +222,15 @@ fn tick_gameplay(
         return; // 等待期间不推进播放头、不判定
     }
 
-    // 手动退出：加载中直接切；游玩中等待 BGM 播完
+    // 手动退出：加载中直接切；游玩中**立即释放**所有 gameplay 音频（不等待
+    // BGM 播完——中途退出无等待语义，由 teardown 统一清理）。
     if keys.just_pressed(KeyCode::Escape) {
         info!("[gameplay] 手动退出（EX {} / Combo {}）", judge_state.ex_score, judge_state.combo);
         if session.loading {
             NextState::set_if_neq(&mut next, AppState::SongSelect);
         } else {
-            session.exiting = true;
-            session.exit_requested_at = TimeStamp::now();
+            audio.stop_all(); // 直接释放 BGM/键音/时钟，不等播完
+            NextState::set_if_neq(&mut next, AppState::SongSelect);
         }
         return;
     }
@@ -239,7 +244,9 @@ fn tick_gameplay(
     if session.loading {
         if audio.is_ready() {
             info!("[gameplay] 首批音频就绪，开始游玩");
-            // 剩余音频交给 1-2 个 worker 后台继续加载
+            // 启动谱面时钟（BGM 以音频线程时钟对齐开始），恢复轨道
+            audio.begin_song(session.loaded.chart.init_bpm().as_f64());
+            // 剩余音频交后台解码池渐进预加载（避免游玩中主线程现解卡顿）
             audio.start_low_loading();
             session.started_at = TimeStamp::now();
             session.player = ChartPlayer::start(
@@ -310,20 +317,21 @@ fn tick_gameplay(
         }
     }
 
-    // 血量归零 → 失败退出（等 BGM 播完）
+    // 血量归零 → 失败退出：立即释放所有 gameplay 音频（不等 BGM 播完）
     if gauge.failed {
         info!("[gameplay] 血量归零（GAUGE FAILED）");
-        session.exiting = true;
-        session.exit_requested_at = TimeStamp::now();
+        audio.stop_all();
+        NextState::set_if_neq(&mut next, AppState::SongSelect);
         return;
     }
 
-    // 谱面结束：全部音符已判定，或超时（等 BGM 播完再回）
+    // 谱面结束：全部音符已判定，或超时 → 进入完成等待，**等背景音乐自然播完**
+    // 再回选曲（exiting 分支负责轮询），保留结尾演出画面。
     let elapsed = now.elapsed_since(session.started_at).as_secs_f64();
     let all_judged = judge_state.judged() >= session.loaded.note_count() as u32;
     if all_judged || elapsed > session.loaded.total_sec + 3.0 {
         info!(
-            "[gameplay] 谱面结束（EX {} / Combo {}）",
+            "[gameplay] 谱面结束（EX {} / Combo {}），等待 BGM 播完…",
             judge_state.ex_score, judge_state.combo
         );
         session.exiting = true;
@@ -651,6 +659,7 @@ fn sync_skin_state(
     lanes: Res<LaneStates>,
     bindings: Res<KeyBindingsByMode>,
     keys: Res<ButtonInput<KeyCode>>,
+    store: Res<SettingsStore>,
     mut runtime: Option<NonSendMut<crate::skin::runtime::SkinRuntime>>,
 ) {
     let Some(runtime) = runtime.as_deref_mut() else { return };
@@ -670,7 +679,9 @@ fn sync_skin_state(
         * 1000.0;
     st.now_y = now_y;
     st.visible_y = visible_y;
-    st.hispeed = ps.current_speed.as_f64();
+    // 玩家下落速度倍率（settings scroll_speed）；#SPEED 谱面速度已由
+    // progressed_y 推进体现，勿乘 current_speed 避免双重加倍
+    st.hispeed = store.get_float("scroll_speed", 1.0) as f64;
     st.bpm_now = ps.current_bpm.as_f64();
     st.bpm_min = data.initial_bpm;
     st.bpm_max = data.initial_bpm;
@@ -757,8 +768,14 @@ fn sync_skin_state(
         }
     }
     // 判定弹字 + BOMB/JUDGE timer（来自 LaneStates.last_hit）
+    // - judge 弹字：只保留**最近一次判定**（连续判定不叠加，旧的立即消失）
+    // - BOMB/keybeam：**每 lane 独立**（多押时各 lane 特效同时显示，beatoraja 语义）
     st.judge_pops.clear();
-    let mut last_judge_ms: Option<f64> = None;
+    let mut latest: Option<(usize, u8, f64)> = None;
+    // BOMB timer 先全关（无判定的 lane 不残留旧特效）
+    for l in 0..st.keys.len() {
+        st.timers[skin::state::TIMER_BOMB_1P_SCRATCH + l] = skin::state::TIMER_OFF;
+    }
     for (key, lane_state) in lanes.iter() {
         let lane_idx = match key {
             bms_rs::chart::prelude::Key::Scratch(_) => 0,
@@ -768,36 +785,42 @@ fn sync_skin_state(
         if let Some((j, at_sec)) = lane_state.last_hit {
             let at_ms = at_sec * 1000.0;
             let elapsed = now_ms - at_ms;
-            if elapsed < 1000.0 && elapsed >= 0.0 {
-                st.judge_pops.push(skin::state::JudgePop {
-                    lane: lane_idx,
-                    judgement: match j {
+            if elapsed >= 0.0 && elapsed < 1000.0 {
+                // 最近判定（judge 弹字用）
+                if latest.is_none_or(|(_, _, t)| at_ms > t) {
+                    let judgement = match j {
                         Judgement::Pg => 0,
                         Judgement::Gr => 1,
                         Judgement::Gd => 2,
                         Judgement::Bd => 3,
                         Judgement::Pr | Judgement::AirPoor => 4,
-                    },
-                    at_ms,
-                });
-                // BOMB timer：命中 500ms 内存开启时刻（at_ms）
-                if elapsed < 500.0 {
+                    };
+                    latest = Some((lane_idx, judgement, at_ms));
+                }
+                // BOMB：该 lane 命中 500ms 内开启（多押各 lane 独立）。
+                // 仅**真实击打**（PG/GR/GD/BD）；POOR/空 POOR 没按到键，不显示打击特效。
+                if elapsed < 500.0
+                    && !matches!(j, Judgement::Pr | Judgement::AirPoor)
+                {
                     st.timers[skin::state::TIMER_BOMB_1P_SCRATCH + lane_idx] = at_ms as i64;
-                } else {
-                    st.timers[skin::state::TIMER_BOMB_1P_SCRATCH + lane_idx] = skin::state::TIMER_OFF;
                 }
                 // Auto 模式：无物理按键，用判定事件模拟 KEYON（短按 150ms，keybeam）
                 if data.auto && elapsed < 150.0 {
                     st.timers[skin::state::TIMER_KEYON_1P_SCRATCH + lane_idx] = at_ms as i64;
                 }
-                last_judge_ms = Some(last_judge_ms.map_or(at_ms, |p| p.max(at_ms)));
             }
         }
     }
-    st.timers[skin::state::TIMER_JUDGE_1P] = match last_judge_ms {
-        Some(at) => at as i64, // 开启时刻（判定时刻）
-        None => skin::state::TIMER_OFF,
-    };
+    if let Some((lane_idx, judgement, at_ms)) = latest {
+        st.judge_pops.push(skin::state::JudgePop {
+            lane: lane_idx,
+            judgement,
+            at_ms,
+        });
+        st.timers[skin::state::TIMER_JUDGE_1P] = at_ms as i64; // 开启时刻（判定时刻）
+    } else {
+        st.timers[skin::state::TIMER_JUDGE_1P] = skin::state::TIMER_OFF;
+    }
     // FULLCOMBO timer（连击 > 0 视为 FC 进行中）
     st.timers[skin::state::TIMER_FULLCOMBO_1P] = if data.combo > 0 {
         0
@@ -812,7 +835,7 @@ fn sync_skin_state(
     };
     // 可见音符窗口：皮肤窗口 = 1/hispeed measure（beatoraja 1/hispeed×speed 可见范围，
     // 与 BPM 无关）；底部由 emit_notes 的 y 范围控制（判定线附近不提前消失）
-    let window_measure = (1.0 / ps.current_speed.as_f64().max(0.01)).min(16.0);
+    let window_measure = (1.0 / st.hispeed.max(0.1)).min(16.0);
     let window_top = now_y + window_measure;
     let note_count = session.loaded.notes.len().min(render.note_entities.len());
     st.notes.clear();
