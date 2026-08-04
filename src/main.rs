@@ -14,6 +14,7 @@ use bevy::{
     audio::AudioPlugin,
     log::{DEFAULT_FILTER, LogPlugin},
     prelude::*,
+    window::{PresentMode, WindowLevel, WindowPlugin, WindowTheme},
 };
 
 use crate::{
@@ -38,6 +39,20 @@ fn main() {
         )
         .add_plugins(
             DefaultPlugins
+                .set(WindowPlugin {
+                    // 基础窗口信息：标题/分辨率/垂直同步（AutoVsync 锁显示器刷新率防撕裂）
+                    primary_window: Some(Window {
+                        title: "rxbms".into(),
+                        name: Some("rxbms".into()),
+                        resolution: (1280, 720).into(),
+                        present_mode: PresentMode::AutoVsync,
+                        resizable: true,
+                        window_theme: Some(WindowTheme::Dark),
+                        window_level: WindowLevel::Normal,
+                        ..default()
+                    }),
+                    ..default()
+                })
                 .set(AssetPlugin {
                     // BMS 音频在铺面目录（系统任意路径），放行未批准的绝对路径加载
                     unapproved_path_mode: UnapprovedPathMode::Allow,

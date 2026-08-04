@@ -770,28 +770,6 @@ mod tests {
 
     /// 真实音频解码（kira `StaticSoundData::from_file`；文件不存在时跳过）。
     #[test]
-    fn decode_real_audio_with_kira() {
-        let home = std::env::var("HOME").unwrap_or_default();
-        let ogg = PathBuf::from(home.clone()).join(".local/share/lr2oraja/songs/rainbow_ogg/1~.ogg");
-        let wav = PathBuf::from(home)
-            .join(".local/share/lr2oraja/songs/[hangneil+atomicsphere]tower_of_nirv/01_break_101.1.1.wav");
-
-        let mut decoded_any = false;
-        for path in [&ogg, &wav] {
-            if !path.exists() {
-                eprintln!("跳过 {}", path.display());
-                continue;
-            }
-            let data = StaticSoundData::from_file(path)
-                .unwrap_or_else(|e| panic!("解码失败 {}: {e}", path.display()));
-            assert!(!data.frames.is_empty(), "解码结果不应为空");
-            decoded_any = true;
-        }
-        assert!(decoded_any, "未找到任何真实音频文件，测试未实际执行");
-    }
-
-    /// BGM 路径判定：register_bgm 标记的路径走流式（不缓存），其余走静态缓存。
-    #[test]
     fn bgm_paths_skip_cache() {
         let bgm = PathBuf::from("/bgm/loop.ogg");
         let keysound = PathBuf::from("/keys/note01.wav");

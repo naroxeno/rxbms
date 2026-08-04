@@ -208,6 +208,8 @@ impl SettingsRegistry {
             // 显示
             SettingDef::bool_("show_fast_slow", "Fast/Slow 显示", SettingCategory::Display, false),
             SettingDef::float_("scroll_speed", "下落速度", SettingCategory::Display, 0.5, 3.0, 0.1, 1.0),
+            // 垂直同步（运行时切换窗口 PresentMode；关闭则不锁帧）
+            SettingDef::bool_("vsync", "垂直同步 (vsync)", SettingCategory::Display, true),
             // 音频
             SettingDef::float_("volume", "全局音量", SettingCategory::Audio, 0.0, 1.0, 0.05, 1.0),
             // 皮肤

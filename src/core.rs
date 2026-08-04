@@ -4,7 +4,9 @@ pub mod keybind;
 pub mod settings;
 pub mod state;
 
+use crate::core::settings::SettingsStore;
 use bevy::prelude::*;
+use bevy::window::PresentMode;
 
 use self::state::AppState;
 
@@ -20,6 +22,7 @@ impl Plugin for CorePlugin {
             .add_systems(
                 Update,
                 (
+                    apply_vsync,
                     update_state_label,
                     // 设置界面内数字键留给输入框，调试切换仅在其它状态生效
                     debug_state_switch.run_if(not(in_state(AppState::Settings))),
@@ -66,6 +69,20 @@ fn setup_core(mut commands: Commands, asset_server: Res<AssetServer>) {
             ..default()
         },
     ));
+}
+
+/// 垂直同步开关（`vsync` 设置）：运行时切换窗口 PresentMode（bevy 原生）。
+///
+/// `AutoVsync`（默认）锁帧到显示器刷新率并避免撕裂；`AutoNoVsync` 不锁帧。
+fn apply_vsync(settings: Res<SettingsStore>, mut window: Single<&mut Window>) {
+    let target = if settings.get_bool("vsync", true) {
+        PresentMode::AutoVsync
+    } else {
+        PresentMode::AutoNoVsync
+    };
+    if window.present_mode != target {
+        window.present_mode = target;
+    }
 }
 
 fn update_state_label(

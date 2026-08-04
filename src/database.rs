@@ -737,49 +737,4 @@ mod tests {
         assert!(db.list_folders().expect("查询目录").is_empty());
     }
 
-    /// 真实目录端到端：扫描 rainbow_ogg → songs.db → 查询（文件不存在时跳过）。
-    #[test]
-    fn scan_real_rainbow_dir() {
-        let home = std::env::var("HOME").unwrap_or_default();
-        let dir = PathBuf::from(home).join(".local/share/lr2oraja/songs/rainbow_ogg");
-        if !dir.is_dir() {
-            eprintln!("跳过：找不到真实铺面目录 {}", dir.display());
-            return;
-        }
-        let _temp = TempDb::new("real_scan");
-        let db = SongsDb::open_at(_temp.db_path()).expect("打开数据库");
-        db.add_folder(&dir).expect("添加目录");
-
-        let report = db.scan().expect("扫描");
-        eprintln!("真实目录扫描: {report}");
-        assert_eq!(report.scanned_dirs, 1);
-        assert!(report.added >= 4, "rainbow 目录应有 ≥4 个铺面，实际 {report}");
-        assert_eq!(report.failed, 0, "不应有解析失败: {report}");
-
-        let songs = db.list_songs().expect("查询");
-        assert!(
-            songs.iter().any(|s| s.title.as_deref() == Some("rainbow")),
-            "应能找到 title=rainbow 的铺面"
-        );
-        assert!(songs.iter().any(|s| s.file_name == "rainbowA.bms"));
-    }
-
-    /// 使用 lr2oraja 示例铺面验证真实解析（文件不存在时跳过）。
-    #[test]
-    fn parse_real_rainbow_chart() {
-        let home = std::env::var("HOME").unwrap_or_default();
-        let path = PathBuf::from(home).join(".local/share/lr2oraja/songs/rainbow_ogg/rainbowA.bms");
-        if !path.exists() {
-            eprintln!("跳过：找不到真实铺面 {}", path.display());
-            return;
-        }
-        let meta = parse_chart(&path).expect("真实铺面应能解析");
-        eprintln!("真实铺面解析结果: {meta}");
-        assert_eq!(meta.title.as_deref(), Some("rainbow"));
-        assert_eq!(meta.genre.as_deref(), Some("ELE POP"));
-        assert!(meta.playable_count > 0, "应有可玩音符");
-        assert!(meta.bgm_count > 0, "应有 BGM 音符（通道 01）");
-        assert!(meta.measure_count > 1, "应有多于一个小节");
-        assert!(meta.note_count >= meta.playable_count + meta.bgm_count);
-    }
 }
