@@ -280,7 +280,8 @@ fn emit_notes(
         // （hispeed=1；BPM/#SPEED 已由 progressed_y 推进体现）
         let sm = scroll_measure(s.now_y, n.position, &s.scroll_timeline);
         // 音符判定点 y（底边）；未来音符更靠上
-        let y = judge_y + sm as f32 * region.h as f32;
+        // px = scroll 加权 measure × region.h × 玩家 hispeed（settings scroll_speed）
+        let y = judge_y + sm as f32 * region.h as f32 * s.hispeed as f32;
         // 可见范围过滤（区域上下留一点余量）。
         // 长音（kind=1）命中后 head 固定在判定线、body 从判定线延伸到 tail，
         // 可见性在下方 LN 分支按 tail_y 判断（head 过线不消失）。
@@ -313,7 +314,7 @@ fn emit_notes(
             // 延伸到仍在下落的 tail——避免 head 过线后整条 body 消失。
             let len = n.length.unwrap_or(0.0) as f64;
             let sm_tail = scroll_measure(s.now_y, n.position + len, &s.scroll_timeline);
-            let tail_y = judge_y + sm_tail as f32 * region.h as f32;
+            let tail_y = judge_y + sm_tail as f32 * region.h as f32 * s.hispeed as f32;
             let body_base = if n.ln_active { judge_y } else { y };
             // 可见性按 body 顶部（tail_y）判断；底部（body_base）不得低于区域下缘
             if tail_y < judge_y - 60.0 || body_base > region_top + 60.0 {
@@ -450,6 +451,59 @@ pub(crate) fn frame_at(d: &Destination, t: f64) -> Option<crate::skin::model::Ke
         }
     }
     Some(frames.last().unwrap().clone())
+}
+
+/// 数字网格裁剪区域（divx×divy 网格，行优先展平；与 `emit_value` 一致）。
+pub fn value_uv(v: &crate::skin::model::ValueDef, f: u32) -> URect {
+    let total = (v.divx * v.divy).max(1);
+    let f = f.min(total - 1);
+    let col = f % v.divx;
+    let row = f / v.divx;
+    let cw = (v.w as u32 / v.divx).max(1);
+    let ch = (v.h as u32 / v.divy).max(1);
+    let sx = v.x as u32 + col * cw;
+    let sy = v.y as u32 + row * ch;
+    URect::new(sx, sy, sx + cw, sy + ch)
+}
+
+/// 收集 source 下所有可能出现的裁剪区域（构建静态 atlas 用）：
+/// images（含帧动画/整图）、values 数字网格、sliders 直接裁剪。
+pub fn collect_source_uvs(
+    desc: &SkinDesc,
+    src_sizes: &std::collections::HashMap<String, (u32, u32)>,
+    source: &str,
+) -> Vec<URect> {
+    let mut uvs: Vec<URect> = Vec::new();
+    for img in desc.images.values() {
+        if img.src != source {
+            continue;
+        }
+        let total = (img.divx * img.divy).max(1);
+        for f in 0..total {
+            uvs.push(frame_uv(img, f, src_sizes));
+        }
+    }
+    for v in &desc.values {
+        if v.src != source {
+            continue;
+        }
+        let total = (v.divx * v.divy).max(1);
+        for f in 0..total {
+            uvs.push(value_uv(v, f));
+        }
+    }
+    for sl in &desc.sliders {
+        if sl.src != source {
+            continue;
+        }
+        uvs.push(URect::new(
+            sl.x as u32,
+            sl.y as u32,
+            (sl.x + sl.w.max(1)) as u32,
+            (sl.y + sl.h.max(1)) as u32,
+        ));
+    }
+    uvs
 }
 
 /// scroll 加权 measure 距离（beatoraja LaneRenderer 逐段累积）：
@@ -721,26 +775,18 @@ pub fn evaluate_into(
             } else {
                 0.0
             };
-            let len = sl.range.max(0) as f32 * value as f32;
-            if len <= 0.0 {
-                continue;
-            }
-            // beatoraja SkinSlider：src 是 source id，裁剪区域 = 对象自身 x/y/w/h（图集内）
+            // beatoraja SkinSlider.draw：**固定大小图像**（region.w/h 不变）沿 direction
+            // 移动 value×range（不是拉伸！song-progress 进度点 12×24 不变、随歌曲移动）
+            let off = value as f32 * sl.range.max(0) as f32;
+            // direction：0=y+（上移）1=x+（右移）2=y-（下移）3=x-（左移），libGDX y 向上
+            let (dx, dy) = match sl.angle {
+                1 => (off, 0.0),
+                2 => (0.0, -off),
+                3 => (-off, 0.0),
+                _ => (0.0, off),
+            };
+            // src 是 source id，裁剪区域 = 对象自身 x/y/w/h（图集内）
             if let Some(src) = desc.sources.get(&sl.src) {
-                // 指令 (x,y,w,h) 语义：y 为底边（y 向上，覆盖 [y, y+h]）
-                let (x, y, w, h) = match sl.angle {
-                    // 0=上 / 1=右 / 2=下 / 3=左（beatoraja SkinSlider.draw：
-                    // x+dir==1?value*range : dir==3?-value*range；y+dir==0?value*range : dir==2?-value*range）
-                    1 => (frame.x as f32, frame.y as f32, len, frame.h as f32),
-                    2 => (
-                        frame.x as f32,
-                        frame.y as f32 - len,
-                        frame.w as f32,
-                        len,
-                    ),
-                    3 => (frame.x as f32 - len, frame.y as f32, len, frame.h as f32),
-                    _ => (frame.x as f32, frame.y as f32, frame.w as f32, len),
-                };
                 out.push(DrawCmd {
                     id,
                     blend: d.blend,
@@ -751,10 +797,10 @@ pub fn evaluate_into(
                         (sl.x + sl.w.max(1)) as u32,
                         (sl.y + sl.h.max(1)) as u32,
                     ),
-                    x,
-                    y,
-                    w,
-                    h,
+                    x: frame.x as f32 + dx,
+                    y: frame.y as f32 + dy,
+                    w: frame.w as f32,
+                    h: frame.h as f32,
                     r: frame.r as u8,
                     g: frame.g as u8,
                     b: frame.b as u8,
@@ -1416,7 +1462,99 @@ mod tests {
             .expect("scratch note");
         assert!((scratch.y - 640.0).abs() < 1.0, "scroll 加权 y={}", scratch.y);
     }
+    #[test]
+    fn song_progress_point_moves() {
+        // song-progress：angle=2，固定大小 12×24 随进度向下移动（y = 1026 - value×826）
+        let (_skin, desc, cfg, state) = load();
+        let sp = desc.sliders.iter().find(|s| s.id == "song-progress").unwrap();
+        assert_eq!(sp.angle, 2);
+        assert_eq!(sp.range, 826);
+        *state.write().unwrap() = sample_state();
+        {
+            let mut s = state.write().unwrap();
+            s.duration_sec = 0.0;
+            s.total_sec = 100.0;
+        }
+        let cmds = evaluate_frame(&desc, &cfg, &state, &Default::default());
+        let p = cmds
+            .iter()
+            .find(|c| c.uv == URect::new(0, 2000, 12, 2024))
+            .expect("song-progress 点");
+        // 固定大小（不被拉长）
+        assert_eq!((p.w, p.h), (12.0, 24.0), "进度点大小应固定");
+        // 0% → 顶部（y=1026）
+        assert!((p.y - 1026.0).abs() < 0.5, "0% 应在顶部 y=1026");
+        // 50% → 下移 413（1026 - 0.5×826）
+        state.write().unwrap().duration_sec = 50.0;
+        let cmds = evaluate_frame(&desc, &cfg, &state, &Default::default());
+        let p50 = cmds
+            .iter()
+            .find(|c| c.uv == URect::new(0, 2000, 12, 2024))
+            .unwrap();
+        assert!((p50.y - (1026.0 - 413.0)).abs() < 1.0, "50% y={}", p50.y);
+        // 100% → 底部（200）
+        state.write().unwrap().duration_sec = 100.0;
+        let cmds = evaluate_frame(&desc, &cfg, &state, &Default::default());
+        let p100 = cmds
+            .iter()
+            .find(|c| c.uv == URect::new(0, 2000, 12, 2024))
+            .unwrap();
+        assert!((p100.y - 200.0).abs() < 1.0, "100% y={}", p100.y);
+    }
+    #[test]
+    fn atlas_uvs_collect() {
+        // collect_source_uvs：收集 src-notes 的图像区域（含 note 变体）
+        let (_skin, desc, _cfg, _state) = load();
+        let uvs = collect_source_uvs(&desc, &Default::default(), "src-notes");
+        assert!(uvs.iter().any(|u| *u == URect::new(140, 0, 230, 30)), "note-w");
+        assert!(uvs.iter().any(|u| *u == URect::new(230, 0, 310, 30)), "note-b");
+        assert!(uvs.iter().any(|u| *u == URect::new(0, 0, 140, 30)), "note-s");
+        // lnb divy=2 → 两帧都收集
+        // lnb-w：140,120 90×60 divy=2 → 帧高 30
+        assert!(uvs.iter().any(|u| *u == URect::new(140, 120, 230, 150)), "lnb 帧0");
+        assert!(uvs.iter().any(|u| *u == URect::new(140, 150, 230, 180)), "lnb 帧1");
+        // src-number 数字网格
+        let nuvs = collect_source_uvs(&desc, &Default::default(), "src-number");
+        assert!(nuvs.len() >= 11, "score-num divx=11 至少 11 格");
+        // value_uv 与 emit_value 一致：score-num 第 7 格 = (7×36, 0, 8×36, 46)
+        let v = desc.value("score-num").unwrap();
+        assert_eq!(value_uv(v, 7), URect::new(252, 0, 288, 46));
+        // 整图（w=-1，src_sizes 传入）→ 源图全尺寸
+        let sizes = std::collections::HashMap::from([("src-bg".to_string(), (1920, 1080))]);
+        let buvs = collect_source_uvs(&desc, &sizes, "src-bg");
+        assert!(buvs.iter().any(|u| *u == URect::new(0, 0, 1920, 1080)), "bg 整图");
+    }
+
+    #[test]
+    fn hispeed_multiplies_note_speed() {
+        // 玩家 hispeed=2 → note 距判定线像素翻倍（px = region.h × hispeed）
+        let (_skin, desc, cfg, state) = load();
+        *state.write().unwrap() = sample_state();
+        {
+            let mut s = state.write().unwrap();
+            s.hispeed = 2.0;
+            s.notes.clear();
+            s.notes.push(NoteState {
+                idx: 0,
+                lane: 0,
+                position: 10.4,
+                length: None,
+                kind: 0,
+                consumed: false,
+                ln_active: false,
+            });
+        }
+        let cmds = evaluate_frame(&desc, &cfg, &state, &Default::default());
+        // now_y=10，dy=0.4 measure，px=880×2=1760 → y = 200 + 0.4×1760 = 904
+        let scratch = cmds
+            .iter()
+            .find(|c| c.uv == URect::new(0, 0, 140, 30))
+            .expect("scratch note");
+        assert!((scratch.y - 904.0).abs() < 1.0, "hispeed=2 y={}", scratch.y);
+    }
 }
+
+
 
 #[cfg(test)]
 mod scroll_tests {

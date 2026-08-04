@@ -51,10 +51,13 @@ pub struct SkinRuntime {
     pub slots: Vec<Entity>,
     /// 槽 id → 槽索引（稳定身份，note 用全局谱面下标，避免窗口波动错配/共用）。
     pub slot_map: HashMap<u64, usize>,
-    /// 每槽当前绑定的 uv（切帧时据此换 layout 句柄）。
+    /// 每槽当前绑定的 uv（切帧时据此换 atlas index，layout 不变）。
     pub slot_uvs: Vec<URect>,
-    /// (src, uv 四元组) → layout 句柄（复用，避免每帧重建 asset）。
-    pub layout_cache: HashMap<(String, u32, u32, u32, u32), Handle<TextureAtlasLayout>>,
+    /// source id → (静态 atlas layout, uv→index 表)：同 source 合批、切帧只改 index。
+    pub atlas: HashMap<
+        String,
+        (Handle<TextureAtlasLayout>, HashMap<(u32, u32, u32, u32), u32>),
+    >,
     /// 纹理是否全部就绪（已建槽池）。
     pub ready: bool,
     /// source id → 源图尺寸（纹理就绪后填充；整图 w=-1 的图像与帧动画用）。
@@ -159,7 +162,7 @@ pub fn load_lua_skin(world: &mut World) {
         slots: Vec::new(),
         slot_map: HashMap::new(),
         slot_uvs: Vec::new(),
-        layout_cache: HashMap::new(),
+        atlas: HashMap::new(),
         ready: false,
         src_sizes: HashMap::new(),
         screen: VirtualScreen::fit(1920.0, 1080.0, 1280.0, 720.0),
@@ -231,6 +234,22 @@ pub fn apply_skin_frame(
                 }
             }
         }
+        // 构建每 source 静态 atlas（同 source 合批 + 切帧只改 index，不重建 layout）
+        for (id, _) in &runtime.textures {
+            let size = runtime.src_sizes.get(id).copied().unwrap_or((1, 1));
+            let mut layout = TextureAtlasLayout::new_empty(UVec2::new(size.0, size.1));
+            let mut map = HashMap::new();
+            for uv in crate::skin::render::collect_source_uvs(&runtime.desc, &runtime.src_sizes, id) {
+                let key = (uv.min.x, uv.min.y, uv.max.x, uv.max.y);
+                if !map.contains_key(&key) {
+                    let idx = layout.add_texture(uv) as u32;
+                    map.insert(key, idx);
+                }
+            }
+            runtime
+                .atlas
+                .insert(id.clone(), (atlas_layouts.add(layout), map));
+        }
         runtime.ready = true;
     }
 
@@ -269,9 +288,10 @@ pub fn apply_skin_frame(
             let Some(h) = runtime.textures.get(&cmd.src) else { continue };
             h.clone()
         };
-        // 需要图片尺寸建 layout（就绪保证存在）
-        let Some(image) = images.get(&handle) else { continue };
-        let size = image.size();
+        // 就绪保证纹理存在（atlas 已构建）
+        if images.get(&handle).is_none() {
+            continue;
+        }
 
         // 槽按 id 查找/创建
         let slot_idx = if let Some(&i) = runtime.slot_map.get(&cmd.id) {
@@ -304,28 +324,17 @@ pub fn apply_skin_frame(
 
         let e = runtime.slots[slot_idx];
         if let Ok((_, mut sprite, mut tf, mut vis)) = q.get_mut(e) {
-            // uv 变化（帧动画切帧）→ 从缓存取或新建 layout，换 atlas 句柄（同 uv 复用句柄）
-            let key = (cmd.src.clone(), cmd.uv.min.x, cmd.uv.min.y, cmd.uv.max.x, cmd.uv.max.y);
+            // uv 变化（帧动画切帧）→ 换 atlas index（layout 固定，同 source 合批）
             if runtime.slot_uvs[slot_idx] != cmd.uv {
-                let layout_handle = runtime
-                    .layout_cache
-                    .entry(key)
-                    .or_insert_with(|| {
-                        let mut layout = TextureAtlasLayout::new_empty(size);
-                        // 整图标记 (0,0,0,0)：用源图全尺寸（bg 等 w=-1 的图像）
-                        if cmd.uv == URect::new(0, 0, 0, 0) {
-                            layout.add_texture(URect::new(0, 0, size.x, size.y));
-                        } else {
-                            layout.add_texture(cmd.uv);
-                        }
-                        atlas_layouts.add(layout)
-                    })
-                    .clone();
-                sprite.texture_atlas = Some(TextureAtlas {
-                    index: 0,
-                    layout: layout_handle,
-                });
-                runtime.slot_uvs[slot_idx] = cmd.uv;
+                if let Some((layout, index_map)) = runtime.atlas.get(&cmd.src) {
+                    let key = (cmd.uv.min.x, cmd.uv.min.y, cmd.uv.max.x, cmd.uv.max.y);
+                    let index = index_map.get(&key).copied().unwrap_or(0);
+                    sprite.texture_atlas = Some(TextureAtlas {
+                        index: index as usize,
+                        layout: layout.clone(),
+                    });
+                    runtime.slot_uvs[slot_idx] = cmd.uv;
+                }
             }
             sprite.image = handle.clone();
             sprite.custom_size = Some(Vec2::new(cmd.w * vs.scale, cmd.h * vs.scale));
