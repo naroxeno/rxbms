@@ -1,0 +1,58 @@
+[package]
+name = "rxbms"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bevy = { version = "0.19.0", features = ["serialize"] }
+bms-rs = { git = "https://github.com/naroxeno/bms-rs.git", version = "1.0.0" }
+# BMS 文件常用 Shift_JIS 编码，bms-rs 只接受 UTF-8，需要转码
+encoding_rs = "0.8"
+# 配置持久化（~/.rxbms/config.json，键位绑定等）
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rusqlite = { version = "0.40.1", features = ["bundled"] }
+# parley 依赖 icu_segmenter 时只开了 compiled_data（default-features=false），
+# 缺少日语等语言的 LSTM 分词模型 → 布局日文文本时报 "No segmentation model for language: ja"
+# 这里显式启用默认 features（compiled_data + auto/lstm），feature unification 全局生效
+icu_segmenter = { version = "2", default-features = false, features = ["compiled_data", "auto"] }
+# 已知 Bevy/parley 内部问题（ja 词典数据缺失），按社区 workaround 处理：
+# 启用 icu_provider 的 logging feature，配合 LogPlugin 的 icu_provider=error 过滤压制噪音
+icu_provider = { version = "2.2.0", features = ["logging"] }
+gametime = "0.7.2"
+symphonia = { version = "0.6.0", default-features = false, features = ["ogg", "vorbis", "wav", "pcm", "flac", "mp3"] }
+cpal = "0.18.1"
+mlua = { version = "0.12.0", features = ["luajit"] }
+# BGA 视频解码（ffmpeg）
+# 跨平台说明：
+# - 默认动态链接：Linux 需 libav*-dev，Windows 需 ffmpeg DLL，macOS 需 brew ffmpeg；
+# - 启用 `static-ffmpeg` feature 可静态编译（自包含，需 C 工具链，编译较慢）。
+ffmpeg-next = { version = "8.1.0", default-features = false, features = ["codec", "format", "software-scaling"] }
+
+[features]
+# 静态编译 ffmpeg（跨平台自包含构建，无需系统 ffmpeg）
+static-ffmpeg = ["ffmpeg-next/build"]
+
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+
+[profile.debugging]
+inherits = "dev"
+debug = true
+
+[target.'cfg(target_os = "linux")']
+# mold，如果您有 GCC 12+
+rustflags = ["-C", "link-arg=-fuse-ld=wild"]
+
+[resolver]
+feature-unification = "workspace"
+
+[profile.release]
+codegen-units = 1
+opt-level = "z"
+strip = "symbols"
+lto = "fat"
+panic = "abort"
