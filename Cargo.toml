@@ -20,8 +20,8 @@ icu_segmenter = { version = "2", default-features = false, features = ["compiled
 # 启用 icu_provider 的 logging feature，配合 LogPlugin 的 icu_provider=error 过滤压制噪音
 icu_provider = { version = "2.2.0", features = ["logging"] }
 gametime = "0.7.2"
-symphonia = { version = "0.6.0", default-features = false, features = ["ogg", "vorbis", "wav", "pcm", "flac", "mp3"] }
-cpal = "0.18.1"
+# 音频系统：kira 内置 cpal 后端 + symphonia 解码（BGM 流式 / 键音静态）
+kira = "0.12.2"
 mlua = { version = "0.12.0", features = ["luajit"] }
 # BGA 视频解码（ffmpeg）
 # 跨平台说明：
@@ -42,6 +42,10 @@ debug = false
 [profile.debugging]
 inherits = "dev"
 debug = true
+
+# kira 音频渲染在音频线程逐采样执行，dev 下不优化会有爆音/高占用（官方文档建议）
+[profile.dev.package.kira]
+opt-level = 3
 
 [target.'cfg(target_os = "linux")']
 # mold，如果您有 GCC 12+

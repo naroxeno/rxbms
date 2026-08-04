@@ -48,7 +48,7 @@ fn main() {
                     filter: format!("{DEFAULT_FILTER},icu_provider=error"),
                     ..default()
                 })
-                // 音频自行管理（rodio 系统输出流 + mixer push，见 gameplay/audio.rs）
+                // 音频自行管理（kira 驱动，见 audio.rs；禁用 Bevy 内置避免双输出流冲突）
                 .disable::<AudioPlugin>(),
         )
         .add_plugins(CorePlugin)

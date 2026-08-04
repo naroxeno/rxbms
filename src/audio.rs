@@ -1,185 +1,511 @@
-//! 全局音频管理系统：低延迟混音器（cpal）+ 多线程解码池 + 缓存/引用计数/卸载。
+//! 全局音频管理系统：kira（cpal 后端）驱动，覆盖官方教程全部六章能力。
 //!
-//! 架构（参考 beatoraja）：
-//! - **输出**：自写混音器 [`mixer::Mixer`]（cpal 输出流 + 固定槽位池逐采样混音），
-//!   短帧缓冲低延迟，播放 = 槽位复用（O(1)）；
-//! - **解码**：Symphonia 解码为 [`mixer::Pcm`]（交错 f32，Arc 共享），多线程池，
-//!   同 codec 复用 `AudioDecoder` 实例；
-//! - **缓存**：[`AudioCache`] 引用计数 + LRU 淘汰（与设备解耦，可独立测试）；
-//! - **卸载**：`AudioLease` 租约——谱面退出 `release` 引用归零 → LRU 淘汰。
+//! 架构（对照 http://tesselo.de/kira/ 六章）：
+//! - **管理器**（第 1-2 章）：`kira::AudioManager<DefaultBackend>` 单实例 Resource，
+//!   后台音频线程渲染，主线程零阻塞；
+//! - **播放**（第 3 章）：键音与小 BGM 采样 = `StaticSoundData`（`Arc` 共享采样、
+//!   克隆廉价、可多路并发，密集事件不掐断）；大 BGM（≥ 2MB）= `StreamingSoundData`
+//!   （流式后台解码，整曲不占内存）；参数（音量/播放速率/声像）支持 `Tween` 平滑过渡；
+//! - **混音器**（第 4 章）：main → {bgm, keysound, metronome, menu} 四条 sub track 分层。
+//!   BMS 无独立打击音效（打击音会干扰键音辨识），故不设 se 轨道；
+//!   节拍器独立轨道（常驻合成音，不污染键音轨的 `num_sounds` 判定）；
+//! - **时钟**（第 5 章）：谱面 clock（BPM × 192 tick，对应 BMS 1/192 分辨率），
+//!   BGM 以 `start_time(clock.time())` 对齐——开始时刻由音频线程精确控制，
+//!   消除主线程 → 音频线程的调度抖动；
+//! - **自定义 Sound**（第 6 章）：[`metronome::MetronomeSound`] 节拍器，
+//!   音频线程实时合成点击音，tempo/开关经命令通道控制。
 //!
-//! 注意：Bevy 的 `AudioPlugin` 已在 main.rs 禁用（避免双输出流冲突）。
+//! 缓存（[`AudioCache`]）与租约（[`AudioLease`]）沿用旧架构：跨游玩 LRU +
+//! 引用计数，缓存对象改为 kira 的 `StaticSoundData`（克隆零拷贝）。
+//! 自写 cpal 混音器与 Symphonia 解码池删除（kira 内部实现，见 Cargo.toml 注释）。
 
-pub mod mixer;
+pub mod metronome;
 
 use std::{
     collections::{HashMap, HashSet, VecDeque},
-    fs::File,
     path::{Path, PathBuf},
-    sync::{
-        Arc, Condvar, Mutex, mpsc,
-        atomic::{AtomicUsize, Ordering},
-    },
-    thread::JoinHandle,
-
+    sync::{mpsc, Arc, Condvar, Mutex},
+    thread,
 };
 
 use bevy::prelude::*;
-use symphonia::core::{
-    audio::AudioSpec,
-    codecs::{
-        CodecParameters,
-        audio::{AudioCodecId, AudioDecoder, AudioDecoderOptions},
-        registry::CodecRegistry,
+use kira::{
+    AudioManagerSettings, Decibels, DefaultBackend, Tween,
+    clock::ClockHandle,
+    clock::ClockSpeed,
+    sound::{
+        FromFileError, PlaybackState,
+        static_sound::StaticSoundData,
+        streaming::{StreamingSoundData, StreamingSoundHandle},
     },
-    errors::Error,
-    formats::{FormatOptions, TrackType, probe::Hint},
-    io::MediaSourceStream,
-    meta::MetadataOptions,
+    track::{TrackBuilder, TrackHandle},
 };
 
 use crate::core::settings::SettingsStore;
 
-use self::mixer::{Mixer, Pcm};
-
-/// 解码 worker 线程数（上限 4）。
-const DECODE_THREADS: usize = 4;
-/// LRU 缓存上限（引用归零后仍保留的音频数）。
+use self::metronome::{MetronomeData, MetronomeHandle};/// LRU 缓存上限（引用归零后仍保留的音频数）。
 ///
 /// 每个音频在缓存生命周期内只解码一次；上限取 512 覆盖常见谱面的音频规模，
 /// 减少跨游玩（LRU 淘汰后重进）时的重复解码。
 const LRU_CACHE_MAX: usize = 512;
 
+/// BGM 走流式解码的文件大小下限（字节）。
+///
+/// 小于该值的 BGM 通道采样（常被密集事件引用）走静态缓存多路并发，
+/// 避免每次事件重开流+掐断旧流导致背景音几乎无声（2026-08 修复的 bug）。
+const STREAMING_MIN_BYTES: u64 = 2_000_000;
+
+/// BGM 走流式解码的最大事件引用次数。
+///
+/// 同一文件被超过该次数的事件触发（循环采样/密集 BGM 序列）即使文件够大
+/// 也走静态缓存——否则每次事件停旧流重开，背景音被掐断。
+const STREAMING_MAX_EVENTS: usize = 8;
+
+/// 后台解码线程池：worker 线程构造 `StaticSoundData`（kira 无后台解码 API，但
+/// `from_file` 是纯 CPU 解码，可在工作线程执行；结果送回主线程缓存）。
+///
+/// 谱面剩余音频（首批之外）在此渐进解码，避免游玩中 `play_synced` 主线程现解卡顿。
+struct DecodePool {
+    tasks: Arc<Mutex<VecDeque<PathBuf>>>,
+    condvar: Arc<Condvar>,
+    #[allow(dead_code)] // 持有句柄保持线程存活（进程退出时随进程结束）
+    _handles: Vec<thread::JoinHandle<()>>,
+}
+
+/// 后台解码线程数。
+const DECODE_THREADS: usize = 4;
+
+impl DecodePool {
+    fn new(tx: mpsc::Sender<(PathBuf, Option<StaticSoundData>)>) -> Self {
+        let tasks: Arc<Mutex<VecDeque<PathBuf>>> = Arc::new(Mutex::new(VecDeque::new()));
+        let condvar = Arc::new(Condvar::new());
+        let mut handles = Vec::new();
+        for _ in 0..DECODE_THREADS {
+            let tasks = tasks.clone();
+            let condvar = condvar.clone();
+            let tx = tx.clone();
+            handles.push(thread::spawn(move || loop {
+                // 取一个任务（空队列时阻塞等待）
+                let path = {
+                    let mut q = match tasks.lock() {
+                        Ok(q) => q,
+                        Err(_) => return,
+                    };
+                    loop {
+                        if let Some(p) = q.pop_front() {
+                            break p;
+                        }
+                        // 空队列：等待唤醒（wait 原子释放锁，唤醒后重新拿锁）
+                        match condvar.wait(q) {
+                            Ok(q2) => q = q2,
+                            Err(_) => return,
+                        }
+                    }
+                };
+                let result = StaticSoundData::from_file(&path).ok();
+                if tx.send((path, result)).is_err() {
+                    break; // 接收端已销毁（应用退出）
+                }
+            }));
+        }
+        Self {
+            tasks,
+            condvar,
+            _handles: handles,
+        }
+    }
+
+    /// 提交一个解码任务。
+    fn submit(&self, path: PathBuf) {
+        let mut q = match self.tasks.lock() {
+            Ok(q) => q,
+            Err(_) => return,
+        };
+        q.push_back(path);
+        drop(q);
+        self.condvar.notify_one();
+    }
+}
+
 /// 全局音频管理器（Resource）。
 #[derive(Resource)]
 pub struct AudioManager {
-    /// 低延迟混音器（cpal 输出流 + 槽位池）。
-    mixer: Mixer,
-    /// 多线程解码池。
-    pool: DecodePool,
-    /// 解码完成队列（worker → 主线程）。
-    ready_rx: Mutex<mpsc::Receiver<(PathBuf, Option<Arc<Pcm>>)>>,
+    /// kira 音频管理器（cpal 输出，音频线程渲染）。
+    kira: kira::AudioManager<DefaultBackend>,
+    /// 主界面（master）音轨：选曲/标题界面的 BGM，独立于 gameplay 生命周期。
+    menu_track: TrackHandle,
+    /// 节拍器专用轨道（常驻合成音，独立于键音轨，避免污染 `is_playing`
+    /// 对键音轨 `num_sounds` 的判定）。
+    #[allow(dead_code)] // 持有句柄以保持轨道存活（节拍器常驻其上）
+    metronome_track: TrackHandle,
+    /// 谱面时钟（BPM × 192 tick）。BGM 播放以 `clock.time()` 对齐。
+    clock: ClockHandle,
+    /// 节拍器（第 6 章自定义 Sound，常驻 se 轨道，tempo/开关可编程控制）。
+    metronome: MetronomeHandle,
+    /// 当前主界面 BGM 流（`stop_menu_bgm` 时取走停止）。
+    menu_handle: Option<StreamingSoundHandle<FromFileError>>,
+    /// 标记为 BGM 且**大文件**（走流式播放，不缓存）的路径。
+    streaming_paths: HashSet<PathBuf>,
     /// 缓存与引用计数（与设备解耦）。
     cache: AudioCache,
-    /// 全局音量（0.0–1.0，播放时应用到槽位）。
-    volume: f32,
-    /// 混音器输出采样率（同步解码兜底时统一重采样到该值）。
-    sample_rate: u32,
-    /// 待低优加载的剩余音频（首批提交后剩余）。
+    /// 后台解码池（首批之外音频渐进预加载）。
+    pool: DecodePool,
+    /// 解码结果队列（worker → 主线程）。
+    ready_rx: Mutex<mpsc::Receiver<(PathBuf, Option<StaticSoundData>)>>,
+    /// 待后台加载的剩余音频（首批提交后剩余）。
     pending_low: Vec<PathBuf>,
+    /// 全局音量（0.0–1.0，线性 → main track 的 dB 音量）。
+    volume: f32,
+    /// 当前铺面的播放资源（轨道 + BGM 流）。`stop_all` 时 take + drop →
+    /// 轨道销毁，其上**所有声音**（含静态 BGM/键音）真正停止，不残留到下一场。
+    song: Option<SongAudio>,
+}
+
+/// 单场铺面的音频资源：BGM 轨 + 键音轨 + 当前 BGM 流。
+///
+/// drop 时两个 `TrackHandle` 触发 kira 轨道移除，轨道上的全部声音随之销毁
+/// （`TrackHandle` 的 `Drop` → `mark_for_removal`）。
+struct SongAudio {
+    /// BGM 流式播放轨道（大文件流式解码）。
+    bgm_track: TrackHandle,
+    /// 键音播放轨道（静态采样，多路并发：键音 + 小 BGM 事件）。
+    keysound_track: TrackHandle,
+    /// 当前正在播放的 BGM 流。
+    bgm_handle: Option<StreamingSoundHandle<FromFileError>>,
+}
+
+impl SongAudio {
+    /// 创建本场铺面的播放轨道。
+    fn new(kira: &mut kira::AudioManager<DefaultBackend>) -> Result<Self, String> {
+        let bgm_track = kira
+            .add_sub_track(TrackBuilder::default())
+            .map_err(|e| format!("创建 BGM 轨道失败: {e}"))?;
+        let keysound_track = kira
+            .add_sub_track(TrackBuilder::default())
+            .map_err(|e| format!("创建键音轨道失败: {e}"))?;
+        Ok(Self {
+            bgm_track,
+            keysound_track,
+            bgm_handle: None,
+        })
+    }
 }
 
 impl AudioManager {
-    /// 打开系统默认输出设备并启动多线程解码池。
+    /// 打开默认输出设备并初始化 kira（三条轨道 + 谱面时钟 + 节拍器）。
     ///
     /// # Errors
     ///
-    /// 无可用音频设备或线程创建失败时返回错误。
+    /// 无可用音频设备、资源超限或后端初始化失败时返回错误。
     pub fn new() -> Result<Self, String> {
-        let mixer = Mixer::open()?;
-        let target_rate = mixer.sample_rate;
-        let (ready_tx, ready_rx) = mpsc::channel::<(PathBuf, Option<Arc<Pcm>>)>();
-        let pool = DecodePool::new(ready_tx, DECODE_THREADS, target_rate)?;
-
+        let mut kira = kira::AudioManager::<DefaultBackend>::new(AudioManagerSettings::default())
+            .map_err(|e| format!("初始化音频后端失败: {e}"))?;
+        let menu_track = kira
+            .add_sub_track(TrackBuilder::default())
+            .map_err(|_| "创建主界面音轨失败".to_string())?;
+        let mut metronome_track = kira
+            .add_sub_track(TrackBuilder::default())
+            .map_err(|_| "创建节拍器轨道失败".to_string())?;
+        // 谱面时钟：初始 120 BPM × 192 分辨率，`begin_song` 时按谱面实际 BPM 调整
+        let clock = kira
+            .add_clock(ClockSpeed::TicksPerMinute(120.0 * 192.0))
+            .map_err(|_| "创建谱面时钟失败".to_string())?;
+        // 节拍器常驻独立轨道（默认静音，`set_metronome` 开启）
+        let metronome = metronome_track
+            .play(MetronomeData::default())
+            .map_err(|_| "启动节拍器失败".to_string())?;
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let pool = DecodePool::new(ready_tx);
         Ok(Self {
-            mixer,
+            kira,
+            menu_track,
+            metronome_track,
+            clock,
+            metronome,
+            menu_handle: None,
+            streaming_paths: HashSet::new(),
+            cache: AudioCache::default(),
             pool,
             ready_rx: Mutex::new(ready_rx),
-            cache: AudioCache::default(),
-            volume: 1.0,
-            sample_rate: target_rate,
             pending_low: Vec::new(),
+            volume: 1.0,
+            song: None,
         })
     }
 
-    /// 谱面进入：获取音频租约（引用计数 +1，记录全部待加载路径，**不立即提交**）。
+    /// 谱面进入：注册 BGM 路径（大文件且稀疏引用 → 流式播放，不缓存）。
     ///
-    /// 加载分两批：`submit_priority` 提交首批（BGM + 前半段，全部 worker 快速加载），
-    /// 就绪后即可开玩；`start_low_loading` 提交剩余（游玩中由 1-2 个 worker 后台加载）。
+    /// **双条件分流**（文件大小 + 事件引用次数，见 [`should_stream_file`]）：
+    /// BMS 的 BGM 通道事件分两类——
+    /// - 真正的长 BGM：文件大（≥ [`STREAMING_MIN_BYTES`]）且事件稀疏（≤
+    ///   [`STREAMING_MAX_EVENTS`]），整曲背景音乐、播放长，走 `StreamingSoundData`
+    ///   流式解码（省内存）；
+    /// - 其余（小采样、或大文件被密集事件引用，如 rainbow 每秒 ~20 个 BGM 事件）：
+    ///   走静态缓存多路并发。否则每次事件 `play_bgm` 停旧流+重开文件+等流式缓冲，
+    ///   背景音会被密集掐断而几乎无声（2026-08 修复的 bug）。
+    ///
+    /// 注意：必须在 `submit_priority` **之前**调用，优先级加载会跳过流式 BGM 文件。
+    pub fn register_bgm(&mut self, stats: std::collections::HashMap<PathBuf, usize>) {
+        self.streaming_paths.clear();
+        for (path, events) in stats {
+            if should_stream_file_with_events(&path, events) {
+                self.streaming_paths.insert(path);
+            }
+        }
+    }
+
+    /// 谱面进入：获取音频租约（引用计数 +1，记录全部待加载路径）。
+    ///
+    /// 加载分两批：`submit_priority` 同步解首批（前 30 秒，少量快），
+    /// 其余进 `pending_low`，开玩后由 `start_low_loading` 后台渐进解码。
     pub fn acquire(&mut self, paths: &[PathBuf]) -> AudioLease {
         let lease = self.cache.acquire(paths);
         self.pending_low.extend(paths.iter().cloned());
         lease
     }
 
-    /// 提交首批高优先级加载（BGM + 前半段音频），从待加载列表移除。
+    /// 提交首批高优先级加载（前 30 秒音频），**同步解码**进缓存（量小，毫秒级）。
+    ///
+    /// BGM 文件跳过（流式播放，不缓存）。剩余音频留在 `pending_low`，
+    /// 开玩后 `start_low_loading` 交后台线程渐进解码——避免游玩中现解卡顿。
     pub fn submit_priority(&mut self, paths: impl IntoIterator<Item = PathBuf>) {
         for path in paths {
+            if !self.should_cache(&path) {
+                self.pending_low.retain(|p| p != &path);
+                continue; // BGM：流式播放，不缓存
+            }
             self.pending_low.retain(|p| p != &path);
             self.cache.mark_priority(&path);
-            self.pool.submit_high(path);
+            if self.cache.get(&path).is_none() {
+                match StaticSoundData::from_file(&path) {
+                    Ok(data) => self.cache.insert_ready(path, data),
+                    Err(e) => {
+                        warn!("[audio] 解码失败 {}: {e}", path.display());
+                        self.cache.remove_requested(&path);
+                    }
+                }
+            }
         }
     }
 
-    /// 开始提交剩余音频（低优先级，游玩中由 1-2 个 worker 后台加载）。
+    /// 开玩后：剩余音频交后台解码池渐进加载（不阻塞主线程）。
     pub fn start_low_loading(&mut self) {
         let low = std::mem::take(&mut self.pending_low);
         let count = low.len();
         for path in low {
-            self.pool.submit_low(path);
+            if self.cache.get(&path).is_none() {
+                self.pool.submit(path);
+            }
         }
         if count > 0 {
-            info!("[audio] 剩余 {count} 个音频低优后台加载");
+            info!("[audio] {count} 个音频后台渐进解码");
         }
     }
 
-    /// 谱面退出：释放租约（引用计数 -1），引用归零的按 LRU 淘汰。
-    pub fn release(&mut self, lease: &AudioLease) {
-        self.cache.release(lease);
-    }
-
-    /// 收拢后台解码结果（每帧调用，非阻塞），并更新 LRU 顺序。
+    /// 收拢后台解码结果（每帧调用，非阻塞）。
     pub fn drain_ready(&mut self) {
-        let rx = self.ready_rx.lock().expect("ready_rx 锁失效");
+        let rx = match self.ready_rx.lock() {
+            Ok(rx) => rx,
+            Err(_) => return,
+        };
         let mut items = Vec::new();
-        while let Ok((path, pcm)) = rx.try_recv() {
-            items.push((path, pcm));
+        while let Ok((path, data)) = rx.try_recv() {
+            items.push((path, data));
         }
         drop(rx);
-        for (path, pcm) in items {
-            match pcm {
-                Some(pcm) => self.cache.insert_ready(path, pcm),
-                // 解码失败：从待加载集合移除，避免永久等待加载
+        for (path, data) in items {
+            match data {
+                Some(data) => self.cache.insert_ready(path, data),
+                // 解码失败：从待加载集合移除，避免永久等待
                 None => self.cache.remove_requested(&path),
             }
         }
     }
 
-    /// 播放一个音频：已就绪则放入混音器槽位；**未就绪则同步解码一次**
-    /// （小文件毫秒级，保证不丢音、不等后台队列）。beatoraja 同款懒加载语义。
+    /// 谱面开始游玩：确保本场谱面的播放轨道存在，重置并启动谱面时钟
+    /// （BPM × 192 tick）。
     ///
-    /// 返回是否实际发起播放（解码失败时为 `false`）。
-    pub fn play_synced(&mut self, path: &Path) -> bool {
-        if let Some(pcm) = self.cache.get(path) {
-            return self.mixer.play(pcm, self.volume);
+    /// 时钟启动后，BGM 以 `clock.time()` 对齐开始；谱面判定仍用实时时钟
+    /// （`TimeStamp`），两者起点一致（loading 完成时刻）。
+    pub fn begin_song(&mut self, bpm: f64) {
+        self.ensure_song_tracks();
+        self.clock.stop();
+        self.clock
+            .set_speed(ClockSpeed::TicksPerMinute(bpm * 192.0), Tween::default());
+        self.clock.start();
+    }
+
+    /// 确保本场谱面的播放轨道已创建（上一场 `stop_all` 销毁后重建）。
+    fn ensure_song_tracks(&mut self) {
+        if self.song.is_some() {
+            return;
         }
-        // 后台队列尚未就绪：同步解码（不占用 worker），并缓存复用
-        match decode_symphonia_sync(path, self.sample_rate) {
-            Ok(pcm) => {
-                self.cache.insert_ready(path.to_path_buf(), pcm.clone());
-                self.mixer.play(pcm, self.volume)
-            }
+        match SongAudio::new(&mut self.kira) {
+            Ok(song) => self.song = Some(song),
+            Err(e) => warn!("[audio] 创建谱面播放轨道失败: {e}"),
+        }
+    }
+
+    /// 谱面退出：释放租约（引用计数 -1），引用归零的按 LRU 淘汰；清空 BGM 标记。
+    pub fn release(&mut self, lease: &AudioLease) {
+        self.cache.release(lease);
+        self.streaming_paths.clear();
+    }
+
+    /// 播放一个音频。
+    ///
+    /// - **大 BGM**（`register_bgm` 标记为流式）：`StreamingSoundData` + 谱面时钟对齐；
+    /// - **键音与小 BGM 采样**：静态缓存播放，**多路并发不掐断**（缓存命中零拷贝，
+    ///   未命中同步解码一次并缓存）。
+    ///
+    /// 返回是否实际发起播放（解码失败或轨道缺失时为 `false`）。
+    pub fn play_synced(&mut self, path: &Path) -> bool {
+        self.ensure_song_tracks();
+        if !self.should_cache(path) {
+            return self.play_bgm(path);
+        }
+        let data = match self.cache.get(path) {
+            Some(data) => data.clone(),
+            None => match StaticSoundData::from_file(path) {
+                Ok(data) => {
+                    self.cache.insert_ready(path.to_path_buf(), data.clone());
+                    data
+                }
+                Err(e) => {
+                    warn!("[audio] 同步解码失败 {}: {e}", path.display());
+                    return false;
+                }
+            },
+        };
+        let Some(song) = self.song.as_mut() else {
+            return false;
+        };
+        song.keysound_track.play(data).is_ok()
+    }
+
+    /// 播放 BGM：流式解码 + 谱面时钟对齐（音频线程精确开始）。
+    ///
+    /// BMS 的 BGM 事件触发语义 = 切换/重播当前 BGM：先停止旧流，避免
+    /// 退出后旧 BGM 残留（kira 的流式 handle 无 Drop 停止语义，必须显式 `stop`）。
+    fn play_bgm(&mut self, path: &Path) -> bool {
+        let Some(song) = self.song.as_mut() else {
+            return false;
+        };
+        if let Some(mut old) = song.bgm_handle.take() {
+            old.stop(Tween::default());
+        }
+        match StreamingSoundData::from_file(path)
+            .map(|d| d.start_time(self.clock.time()))
+        {
+            Ok(data) => match song.bgm_track.play(data) {
+                Ok(handle) => {
+                    song.bgm_handle = Some(handle);
+                    true
+                }
+                Err(e) => {
+                    warn!("[audio] BGM 播放失败 {}: {e}", path.display());
+                    false
+                }
+            },
             Err(e) => {
-                warn!("[audio] 同步解码失败 {}: {e}", path.display());
+                warn!("[audio] BGM 解码失败 {}: {e}", path.display());
                 false
             }
         }
     }
 
-    /// 停止当前所有正在播放的音频（退出谱面时调用）。
-    pub fn stop_all(&mut self) {
-        self.mixer.stop_all();
+    /// 播放主界面（选曲/标题）BGM：流式解码，切换时先停旧曲。
+    ///
+    /// 独立于 gameplay 音轨：`stop_all` 不会碰它，生命周期由选曲界面控制
+    /// （进入游玩/退出选曲时 `stop_menu_bgm`）。
+    /// 预留：当前无主界面音乐源配置，接入（如设置项指定选曲 BGM 路径）后调用。
+    #[allow(dead_code)]
+    pub fn play_menu_bgm(&mut self, path: &Path) -> bool {
+        self.stop_menu_bgm();
+        match StreamingSoundData::from_file(path) {
+            Ok(data) => match self.menu_track.play(data) {
+                Ok(handle) => {
+                    self.menu_handle = Some(handle);
+                    true
+                }
+                Err(e) => {
+                    warn!("[audio] 主界面 BGM 播放失败 {}: {e}", path.display());
+                    false
+                }
+            },
+            Err(e) => {
+                warn!("[audio] 主界面 BGM 解码失败 {}: {e}", path.display());
+                false
+            }
+        }
     }
 
-    /// 是否还有声音在播放（用于退出时等待 BGM 自然结束）。
+    /// 停止主界面 BGM（进入游玩 / 退出选曲时调用）。
+    pub fn stop_menu_bgm(&mut self) {
+        if let Some(mut handle) = self.menu_handle.take() {
+            handle.stop(Tween::default());
+        }
+    }
+
+    /// 该路径是否走静态缓存播放（而非 BGM 流式）。
+    ///
+    /// 注意：若同一 wav 同时被 BGM 事件与键音事件引用，BGM 标记优先——
+    /// 键音事件会走流式分支（每次新开流），失去即时性；BMS 中此情况罕见，
+    /// 保持与 beatoraja 一致的"BGM 通道优先"语义。
+    fn should_cache(&self, path: &Path) -> bool {
+        !is_streaming_path(&self.streaming_paths, path)
+    }
+
+    /// 停止并**销毁**所有正在播放的 gameplay 音频（退出谱面时调用）：
+    /// drop 本场谱面的播放轨道 → 轨道上的全部声音（大 BGM 流 + 静态 BGM + 键音）
+    /// 随之停止；暂停谱面时钟。
+    ///
+    /// 注意：不用 `pause`——pause 只暂停不销毁，下一场 `resume` 会让旧声音
+    /// 复活重叠（2026-08 修复的 bug）。不影响主界面音轨（`menu_track`）。
+    pub fn stop_all(&mut self) {
+        // drop SongAudio：两个 TrackHandle 触发 kira 轨道移除（`mark_for_removal`），
+        // 轨道默认 `persist_until_sounds_finish=false`，下一音频回调周期即整体销毁，
+        // 其上所有声音（大 BGM 流 + 静态 BGM + 键音）随之停止，无"播完才停"残留。
+        self.song = None;
+        self.clock.pause();
+    }
+
+    /// 是否还有音频在播放（用于完成谱面时等待背景音乐自然结束）。
+    ///
+    /// 检查本场谱面轨道：BGM 流 + 键音轨（键音 + 小 BGM 采样都在这条轨，
+    /// `num_sounds` 不受常驻节拍器影响——节拍器在独立轨道）。
     #[must_use]
     pub fn is_playing(&self) -> bool {
-        !self.mixer.is_idle()
+        self.song.as_ref().is_some_and(|s| {
+            s.bgm_handle
+                .as_ref()
+                .is_some_and(|h| h.state() == PlaybackState::Playing)
+                || s.keysound_track.num_sounds() > 0
+        })
     }
 
-    /// 设置全局音量（0.0–1.0）。
+    /// 设置全局音量（0.0–1.0，线性值 → main track 的 dB，`Tween` 平滑过渡）。
     pub fn set_volume(&mut self, volume: f32) {
-        self.volume = volume.clamp(0.0, 1.0);
+        let volume = volume.clamp(0.0, 1.0);
+        if (self.volume - volume).abs() < 1e-4 {
+            return;
+        }
+        self.volume = volume;
+        self.kira
+            .main_track()
+            .set_volume(linear_to_db(volume), Tween::default());
+    }
+
+    /// 控制节拍器（第 6 章自定义 Sound）：拍速 + 开关。
+    /// 预留：后续接入设置/键位（如练习模式节拍器）。
+    #[allow(dead_code)]
+    pub fn set_metronome(&mut self, tempo: f64, enabled: bool) {
+        self.metronome.set_tempo(tempo);
+        self.metronome.set_enabled(enabled);
+        info!(
+            "[audio] 节拍器 {}（{tempo} BPM）",
+            if enabled { "开启" } else { "关闭" }
+        );
     }
 
     /// 是否已请求的音频全部就绪（首批语义见 [`AudioCache`]）。
@@ -196,6 +522,33 @@ impl AudioManager {
     }
 }
 
+/// 路径是否已被标记为 BGM（流式播放，不缓存）。
+fn is_streaming_path(streaming: &HashSet<PathBuf>, path: &Path) -> bool {
+    streaming.contains(path)
+}
+
+/// 文件是否应走流式解码（真长 BGM）：按磁盘大小判定，文件不存在
+/// 或过小时返回 `false`（走静态缓存，多路并发）。
+fn should_stream_file(path: &Path) -> bool {
+    std::fs::metadata(path)
+        .map(|m| m.len() >= STREAMING_MIN_BYTES)
+        .unwrap_or(false)
+}
+
+/// 组合判定：文件大小 + 事件稀疏度（`register_bgm` 的分流决策）。
+fn should_stream_file_with_events(path: &Path, events: usize) -> bool {
+    should_stream_file(path) && events <= STREAMING_MAX_EVENTS
+}
+
+/// 线性音量（0.0–1.0）→ kira 分贝值。0 静音映射到 `Decibels::SILENCE`。
+fn linear_to_db(linear: f32) -> Decibels {
+    if linear <= f32::EPSILON {
+        Decibels::SILENCE
+    } else {
+        Decibels(20.0 * linear.log10())
+    }
+}
+
 /// 谱面持有的音频租约（记录占用的路径，退出时交还 `AudioManager`）。
 #[derive(Debug, Default)]
 pub struct AudioLease {
@@ -203,15 +556,18 @@ pub struct AudioLease {
 }
 
 /// 音频缓存：引用计数 + LRU 淘汰 + 加载进度（纯逻辑，与设备/线程解耦）。
+///
+/// 缓存对象为 kira `StaticSoundData`（采样 `Arc` 共享，克隆零拷贝）。
 #[derive(Default)]
 struct AudioCache {
-    /// 已就绪缓存：path → PCM（Arc 共享）。
-    cache: HashMap<PathBuf, Arc<Pcm>>,
+    /// 已就绪缓存：path → 静态声音数据。
+    cache: HashMap<PathBuf, StaticSoundData>,
     /// 引用计数：path → 持有租约数。
     refs: HashMap<PathBuf, usize>,
     /// 最近使用顺序（末尾最新，用于 LRU 淘汰）。
     lru: Vec<PathBuf>,
     /// 已请求加载的路径集合。
+    #[allow(dead_code)] // 与 priority_set 一起构成加载进度语义
     requested: HashSet<PathBuf>,
     /// 首批（开玩必需）路径集合：就绪即视为可开始游玩。
     priority_set: HashSet<PathBuf>,
@@ -241,8 +597,8 @@ impl AudioCache {
     }
 
     /// 收拢一个解码完成的结果，更新 LRU 顺序并尝试淘汰。
-    fn insert_ready(&mut self, path: PathBuf, pcm: Arc<Pcm>) {
-        self.cache.insert(path.clone(), pcm);
+    fn insert_ready(&mut self, path: PathBuf, data: StaticSoundData) {
+        self.cache.insert(path.clone(), data);
         self.lru.retain(|p| p != &path);
         self.lru.push(path);
         self.evict_if_needed();
@@ -259,7 +615,7 @@ impl AudioCache {
         self.priority_set.insert(path.to_path_buf());
     }
 
-    fn get(&self, path: &Path) -> Option<Arc<Pcm>> {
+    fn get(&self, path: &Path) -> Option<StaticSoundData> {
         self.cache.get(path).cloned()
     }
 
@@ -297,295 +653,53 @@ impl AudioCache {
     }
 }
 
-/// 任务队列（单锁保护双队列，避免多锁等待丢失唤醒）。
-struct TaskQueues {
-    high: VecDeque<PathBuf>,
-    low: VecDeque<PathBuf>,
-}
-
-impl TaskQueues {
-    fn new() -> Self {
-        Self {
-            high: VecDeque::new(),
-            low: VecDeque::new(),
-        }
-    }
-}
-
-/// 多线程解码池：优先级双队列 + N 个 worker。
-///
-/// - **High 队列**（首批/BGM）：所有 worker 可处理，优先取出；
-/// - **Low 队列**（游玩中后续加载）：最多 [`LOW_WORKER_LIMIT`] 个 worker 同时处理，
-///   避免解码占用过多 CPU 影响游玩帧率。
-///
-/// 双队列共用一把锁 + 一个条件变量：任何提交都会唤醒等待中的 worker，
-/// 唤醒后重新检查两个队列（避免只等 Low 却错过 High 的唤醒丢失）。
-struct DecodePool {
-    tasks: Arc<Mutex<TaskQueues>>,
-    condvar: Arc<Condvar>,
-    /// 正在处理 Low 任务的 worker 数（仅 worker 线程经 Arc clone 访问）。
-    #[allow(dead_code)]
-    low_active: Arc<AtomicUsize>,
-    _handles: Vec<JoinHandle<()>>,
-}
-
-/// Low（后续加载）任务最多同时处理的 worker 数。
-const LOW_WORKER_LIMIT: usize = 2;
-
-impl DecodePool {
-    /// 启动 `threads` 个解码 worker。
-    ///
-    /// # Errors
-    ///
-    /// 线程创建失败时返回错误。
-    fn new(
-        ready_tx: mpsc::Sender<(PathBuf, Option<Arc<Pcm>>)>,
-        threads: usize,
-        target_rate: u32,
-    ) -> Result<Self, String> {
-        let tasks = Arc::new(Mutex::new(TaskQueues::new()));
-        let condvar = Arc::new(Condvar::new());
-        let low_active = Arc::new(AtomicUsize::new(0));
-        let mut handles = Vec::with_capacity(threads);
-        for _ in 0..threads {
-            let tasks = Arc::clone(&tasks);
-            let condvar = Arc::clone(&condvar);
-            let low_active = Arc::clone(&low_active);
-            let ready_tx = ready_tx.clone();
-            let handle = std::thread::Builder::new()
-                .name("rxbms-audio-decode".into())
-                .spawn(move || {
-                    // 每个 worker 维护一个可复用的 Symphonia 音频解码器（同 codec 复用，
-                    // 避免每个文件都创建新的解码器实例）。
-                    let registry = symphonia::default::get_codecs();
-                    let mut cached_decoder: Option<(AudioCodecId, Box<dyn AudioDecoder>)> = None;
-                    loop {
-                        // 取任务：优先 High；Low 受并发上限约束；都不可取才等待
-                        let task: Option<(PathBuf, bool)> = {
-                            let mut q = tasks.lock().expect("解码任务队列锁失效");
-                            loop {
-                                if let Some(t) = q.high.pop_front() {
-                                    break Some((t, false));
-                                }
-                                let active = low_active.load(Ordering::Relaxed);
-                                if active < LOW_WORKER_LIMIT
-                                    && let Some(t) = q.low.pop_front()
-                                {
-                                    low_active.fetch_add(1, Ordering::Relaxed);
-                                    break Some((t, true));
-                                }
-                                q = condvar.wait(q).expect("解码任务队列等待失效");
-                            }
-                        };
-                        if let Some((path, is_low)) = task {
-                            match decode_symphonia(&path, registry, &mut cached_decoder, target_rate)
-                            {
-                                Ok(pcm) => {
-                                    let _ = ready_tx.send((path, Some(pcm)));
-                                }
-                                Err(e) => {
-                                    warn!("[audio] 解码失败 {}: {e}", path.display());
-                                    // 失败也回传（None），让主线程跳过该文件不再等待
-                                    let _ = ready_tx.send((path, None));
-                                }
-                            }
-                            if is_low {
-                                low_active.fetch_sub(1, Ordering::Relaxed);
-                            }
-                            condvar.notify_one(); // 唤醒等待的 worker（Low 槽位或新任务）
-                        }
-                    }
-                })
-                .map_err(|e| format!("启动解码线程失败: {e}"))?;
-            handles.push(handle);
-        }
-        Ok(Self {
-            tasks,
-            condvar,
-            low_active,
-            _handles: handles,
-        })
-    }
-
-    /// 提交高优先级任务（首批，唤醒一个 worker）。
-    fn submit_high(&self, path: PathBuf) {
-        self.tasks
-            .lock()
-            .expect("解码任务队列锁失效")
-            .high
-            .push_back(path);
-        self.condvar.notify_one();
-    }
-
-    /// 提交低优先级任务（游玩中后续加载，唤醒一个 worker）。
-    fn submit_low(&self, path: PathBuf) {
-        self.tasks
-            .lock()
-            .expect("解码任务队列锁失效")
-            .low
-            .push_back(path);
-        self.condvar.notify_one();
-    }
-}
-
-/// 单文件同步解码（播放兜底用）：不复用解码器，每次新建。
-fn decode_symphonia_sync(path: &Path, target_rate: u32) -> Result<Arc<Pcm>, String> {
-    let registry = symphonia::default::get_codecs();
-    decode_symphonia(path, registry, &mut None, target_rate)
-}
-
-/// 用 Symphonia 解码音频文件为 [`Pcm`]（交错 f32）。worker 线程执行。
-///
-/// `cached_decoder` 实现**解码器复用**：同一 worker 处理同 codec（如 ogg/vorbis）的
-/// 连续文件时，复用已实例化的 `AudioDecoder`（`reset()` 后重新用于新流）。
-/// 输出统一重采样到 `target_rate`（混音器输出采样率），避免混音端二次转换。
-fn decode_symphonia(
-    path: &Path,
-    registry: &CodecRegistry,
-    cached_decoder: &mut Option<(AudioCodecId, Box<dyn AudioDecoder>)>,
-    target_rate: u32,
-) -> Result<Arc<Pcm>, String> {
-    let file = File::open(path).map_err(|e| format!("打开失败: {e}"))?;
-    let mss = MediaSourceStream::new(Box::new(file), Default::default());
-    let mut hint = Hint::new();
-    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-        hint.with_extension(ext);
-    }
-    let mut format = symphonia::default::get_probe()
-        .probe(&hint, mss, FormatOptions::default(), MetadataOptions::default())
-        .map_err(|e| format!("格式探测失败: {e}"))?;
-    let track = format
-        .first_track(TrackType::Audio)
-        .ok_or_else(|| "无音频轨道".to_string())?;
-    // 拷贝所需数据，避免借用 format 阻碍后续 next_packet（&mut）
-    let track_id = track.id;
-    let codec_params = track
-        .codec_params
-        .clone()
-        .ok_or_else(|| "无音频编解码参数".to_string())?;
-    let CodecParameters::Audio(params) = codec_params else {
-        return Err("无音频编解码参数".into());
-    };
-    let codec_id = params.codec;
-
-    // 复用或新建解码器（同 codec 复用并 reset，否则重建）
-    let mut decoder: Box<dyn AudioDecoder> = match cached_decoder.take() {
-        Some((id, mut d)) if id == codec_id => {
-            d.reset();
-            d
-        }
-        _ => {
-            let registered = registry
-                .get_audio_decoder(codec_id)
-                .ok_or_else(|| "不支持的音频编码".to_string())?;
-            (registered.factory)(&params, &AudioDecoderOptions::default())
-                .map_err(|e| format!("创建解码器失败: {e}"))?
-        }
-    };
-
-    // 解码循环：逐 packet 解码并交错收集为 f32
-    let mut all: Vec<f32> = Vec::new();
-    let mut channels = 0u16;
-    let mut sample_rate = 0u32;
-    while let Ok(Some(packet)) = format.next_packet() {
-        if packet.track_id != track_id {
-            continue;
-        }
-        match decoder.decode(&packet) {
-            Ok(decoded) => {
-                let spec: &AudioSpec = decoded.spec();
-                channels = spec.channels().count() as u16;
-                sample_rate = spec.rate();
-                let frames = decoded.frames();
-                let mut out = vec![0.0f32; frames * channels as usize];
-                decoded.copy_to_slice_interleaved::<f32, _>(&mut out);
-                all.extend_from_slice(&out);
-            }
-            Err(Error::DecodeError(_)) => continue, // 跳过损坏包
-            Err(_) => break,                        // ResetRequired 等 → 结束本次
-        }
-    }
-
-    // 回存解码器供后续文件复用（失败路径不缓存）
-    *cached_decoder = Some((codec_id, decoder));
-
-    if channels == 0 || sample_rate == 0 || all.is_empty() {
-        return Err("无有效音频数据".into());
-    }
-
-    // 统一到混音器输出采样率（线性重采样）
-    if sample_rate != target_rate {
-        let ch = channels as usize;
-        all = resample_linear(&all, ch, sample_rate, target_rate);
-        sample_rate = target_rate;
-    }
-
-    Ok(Arc::new(Pcm::new(all, channels, sample_rate)))
-}
-
-/// 简单线性插值重采样（交错平面，`from` → `to`）。
-fn resample_linear(samples: &[f32], channels: usize, from: u32, to: u32) -> Vec<f32> {
-    if from == to || channels == 0 || samples.len() < channels {
-        return samples.to_vec();
-    }
-    let src_frames = samples.len() / channels;
-    let dst_frames = ((src_frames as f64 * f64::from(to) / f64::from(from)) as usize).max(1);
-    let ratio = f64::from(to) / f64::from(from);
-    let mut out = vec![0.0f32; dst_frames * channels];
-    for ch in 0..channels {
-        for i in 0..dst_frames {
-            let pos = i as f64 / ratio;
-            let i0 = (pos.floor() as usize).min(src_frames - 1);
-            let i1 = (i0 + 1).min(src_frames - 1);
-            let frac = (pos - pos.floor()) as f32;
-            let a = samples[i0 * channels + ch];
-            let b = samples[i1 * channels + ch];
-            out[i * channels + ch] = a + (b - a) * frac;
-        }
-    }
-    out
-}
-
-/// 音频管理插件：初始化管理器 + 每帧收拢解码结果。
+/// 音频管理插件：初始化管理器 + 每帧同步音量设置。
 pub struct AudioManagerPlugin;
 
 impl Plugin for AudioManagerPlugin {
     fn build(&self, app: &mut App) {
         app.add_systems(Startup, init_audio_manager)
-            .add_systems(Update, drain_audio_manager);
+            .add_systems(Update, (sync_volume, drain_audio_manager));
     }
 }
 
 fn init_audio_manager(mut commands: Commands) {
     match AudioManager::new() {
         Ok(manager) => {
-            info!(
-                "[audio] 音频系统就绪（{} 线程解码，输出 {}Hz）",
-                DECODE_THREADS,
-                manager.mixer.sample_rate
-            );
+            info!("[audio] 音频系统就绪（kira/cpal 后端，内部缓冲 128 采样）");
             commands.insert_resource(manager);
         }
         Err(e) => error!("[audio] 初始化失败: {e}"),
     }
 }
 
-/// 每帧收拢后台解码结果（全局，非阻塞），并同步音量设置。
-fn drain_audio_manager(mut manager: ResMut<AudioManager>, store: Res<SettingsStore>) {
-    manager.drain_ready();
+/// 每帧把设置里的全局音量同步到 main track（变化时才下发，避免刷命令）。
+fn sync_volume(mut manager: ResMut<AudioManager>, store: Res<SettingsStore>) {
     let volume = store.get_float("volume", 1.0) as f32;
-    if (manager.volume - volume).abs() > 0.001 {
-        manager.set_volume(volume);
-    }
+    manager.set_volume(volume);
+}
+
+/// 每帧收拢后台解码结果（非阻塞，渐进预加载入缓存）。
+fn drain_audio_manager(mut manager: ResMut<AudioManager>) {
+    manager.drain_ready();
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use self::mixer::Pcm as TestPcm;
+    use kira::{
+        Frame,
+        sound::static_sound::StaticSoundSettings,
+    };
 
-    fn pcm(samples: Vec<f32>, channels: u16) -> Arc<Pcm> {
-        Arc::new(Pcm::new(samples, channels, 44_100))
+    /// 构造一段静态声音数据（不依赖真实文件）。
+    fn static_data(samples: usize) -> StaticSoundData {
+        StaticSoundData {
+            sample_rate: 44_100,
+            frames: vec![Frame::ZERO; samples].into(),
+            settings: StaticSoundSettings::default(),
+            slice: None,
+        }
     }
 
     #[test]
@@ -603,8 +717,8 @@ mod tests {
         // 就绪后 is_ready（首批：标记 a/b 为 priority）
         c.mark_priority(&a);
         c.mark_priority(&b);
-        c.insert_ready(a.clone(), pcm(vec![0.0; 8], 1));
-        c.insert_ready(b.clone(), pcm(vec![0.0; 8], 1));
+        c.insert_ready(a.clone(), static_data(8));
+        c.insert_ready(b.clone(), static_data(8));
         assert!(c.is_ready());
         assert_eq!(c.progress(), (2, 2));
         assert!(c.get(&a).is_some());
@@ -632,7 +746,7 @@ mod tests {
         }
         let lease = c.acquire(&paths);
         for p in &paths {
-            c.insert_ready(p.clone(), pcm(vec![0.0; 8], 1));
+            c.insert_ready(p.clone(), static_data(8));
         }
         // 全部释放（无引用）
         c.release(&lease);
@@ -642,35 +756,25 @@ mod tests {
         assert!(c.get(&paths[paths.len() - 1]).is_some(), "最新应保留");
     }
 
-    /// 线性重采样（采样率统一逻辑）。
+    /// 线性音量 → dB 换算（main track 音量映射）。
     #[test]
-    fn sample_rate_normalization() {
-        // 22050 → 44100（2x 上采样，帧数翻倍）
-        let mono: Vec<f32> = (0..10).map(|i| i as f32).collect();
-        let up = resample_linear(&mono, 1, 22_050, 44_100);
-        assert_eq!(up.len(), 20);
-        assert!((up[0] - 0.0).abs() < 1e-4);
-        assert!((up[19] - 9.0).abs() < 1e-4);
-
-        // 同采样率原样返回
-        assert_eq!(resample_linear(&mono, 1, 44_100, 44_100), mono);
-
-        // 立体声交错
-        let stereo: Vec<f32> = (0..8).map(|i| i as f32).collect(); // 4 帧
-        let out = resample_linear(&stereo, 2, 44_100, 48_000);
-        assert!(out.len() % 2 == 0);
-        assert_eq!(out.len() / 2, 4, "4 帧 × 48/44.1 ≈ 4.35 → floor 4");
+    fn linear_volume_to_decibels() {
+        assert_eq!(linear_to_db(1.0), Decibels(0.0));
+        assert_eq!(linear_to_db(0.0), Decibels::SILENCE);
+        // 0.5 → 20·log10(0.5) ≈ -6.02 dB
+        let db = linear_to_db(0.5);
+        assert!((db.0 - (-6.0206)).abs() < 1e-3, "db={}", db.0);
+        // 单调：音量越小 dB 越低
+        assert!(linear_to_db(0.2).0 < linear_to_db(0.8).0);
     }
 
-    /// 真实音频解码 + 解码器复用（文件不存在时跳过）。
+    /// 真实音频解码（kira `StaticSoundData::from_file`；文件不存在时跳过）。
     #[test]
-    fn decode_real_audio_with_reuse() {
+    fn decode_real_audio_with_kira() {
         let home = std::env::var("HOME").unwrap_or_default();
         let ogg = PathBuf::from(home.clone()).join(".local/share/lr2oraja/songs/rainbow_ogg/1~.ogg");
         let wav = PathBuf::from(home)
             .join(".local/share/lr2oraja/songs/[hangneil+atomicsphere]tower_of_nirv/01_break_101.1.1.wav");
-        let registry = symphonia::default::get_codecs();
-        let mut cached: Option<(AudioCodecId, Box<dyn AudioDecoder>)> = None;
 
         let mut decoded_any = false;
         for path in [&ogg, &wav] {
@@ -678,18 +782,69 @@ mod tests {
                 eprintln!("跳过 {}", path.display());
                 continue;
             }
-            let pcm = decode_symphonia(path, registry, &mut cached, 44_100)
+            let data = StaticSoundData::from_file(path)
                 .unwrap_or_else(|e| panic!("解码失败 {}: {e}", path.display()));
-            assert!(!pcm.samples.is_empty(), "解码结果不应为空");
-            assert_eq!(pcm.sample_rate, 44_100, "采样率应统一到目标");
+            assert!(!data.frames.is_empty(), "解码结果不应为空");
             decoded_any = true;
         }
-        // 连续两个同格式文件时 cached 应被复用（不报错即通过）
-        if ogg.exists() {
-            let _ = decode_symphonia(&ogg, registry, &mut cached, 44_100)
-                .expect("复用解码器再解码同格式文件");
-        }
         assert!(decoded_any, "未找到任何真实音频文件，测试未实际执行");
-        let _ = TestPcm::new(vec![], 0, 0); // 保持类型引用
+    }
+
+    /// BGM 路径判定：register_bgm 标记的路径走流式（不缓存），其余走静态缓存。
+    #[test]
+    fn bgm_paths_skip_cache() {
+        let bgm = PathBuf::from("/bgm/loop.ogg");
+        let keysound = PathBuf::from("/keys/note01.wav");
+        let mut streaming = HashSet::new();
+        streaming.insert(bgm.clone());
+        assert!(!should_cache_with(&streaming, &bgm), "BGM 不应进缓存");
+        assert!(should_cache_with(&streaming, &keysound), "键音应进缓存");
+    }
+
+    /// [`should_cache`] 的判定（AudioManager 需真音频设备无法构造，
+    /// 用提取的纯函数等价验证）。
+    fn should_cache_with(streaming: &HashSet<PathBuf>, path: &Path) -> bool {
+        !is_streaming_path(streaming, path)
+    }
+
+    /// 大小 + 事件数分流：大文件且稀疏引用走流式，其余走静态缓存。
+    #[test]
+    fn streaming_by_file_size() {
+        use std::io::Write;
+
+        let dir = std::env::temp_dir().join(format!("rxbms-audio-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("创建临时目录");
+        let big = dir.join("big.ogg");
+        let small = dir.join("small.ogg");
+        let missing = dir.join("missing.ogg");
+
+        let mut f = std::fs::File::create(&big).expect("创建大文件");
+        f.write_all(&vec![0u8; STREAMING_MIN_BYTES as usize]).expect("写入大文件");
+        let mut f = std::fs::File::create(&small).expect("创建小文件");
+        f.write_all(&[0u8; 100]).expect("写入小文件");
+
+        assert!(should_stream_file(&big), "≥ 阈值应走流式");
+        assert!(!should_stream_file(&small), "小文件应走静态缓存");
+        assert!(!should_stream_file(&missing), "不存在的文件不应走流式");
+
+        // 事件稀疏度：大文件但被密集事件引用 → 仍走静态（避免掐断）
+        assert!(
+            should_stream_file_with_events(&big, 1),
+            "大文件+稀疏事件应走流式"
+        );
+        assert!(
+            !should_stream_file_with_events(&big, STREAMING_MAX_EVENTS + 1),
+            "大文件+密集事件应走静态缓存（否则背景音被掐断）"
+        );
+        assert!(
+            !should_stream_file_with_events(&small, 1),
+            "小文件+稀疏事件也应走静态"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+
+
+

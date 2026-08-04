@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use bevy::prelude::*;
 
 use crate::{
+    audio::AudioManager,
     core::{state::AppState, UiFont},
     database::SongsDb,
     gameplay::chart::SelectedChart,
@@ -85,16 +86,19 @@ fn enter_song_select(mut commands: Commands, db: Res<SongsDb>, ui_font: Res<UiFo
         });
 }
 
-/// 点击铺面行 → 写入 `SelectedChart` 并进入游玩。
+/// 点击铺面行 → 写入 `SelectedChart` 并进入游玩；离开时停止主界面 BGM。
 #[allow(clippy::type_complexity)] // Bevy 系统 Query 参数
 fn song_row_click(
     mut commands: Commands,
     mut next: ResMut<NextState<AppState>>,
+    mut audio: ResMut<AudioManager>,
     rows: Query<(&Interaction, &SongRow), (Changed<Interaction>, With<Button>)>,
 ) {
     for (interaction, row) in &rows {
         if *interaction == Interaction::Pressed {
             info!("[song-select] 选择: {}", row.title);
+            // 主界面音轨与 gameplay 互斥：进入游玩前停掉选曲 BGM
+            audio.stop_menu_bgm();
             commands.insert_resource(SelectedChart {
                 path: row.path.clone(),
                 title: row.title.clone(),
@@ -104,8 +108,14 @@ fn song_row_click(
     }
 }
 
-fn exit_song_select(mut commands: Commands, roots: Query<Entity, With<SongListUi>>) {
+fn exit_song_select(
+    mut commands: Commands,
+    mut audio: ResMut<AudioManager>,
+    roots: Query<Entity, With<SongListUi>>,
+) {
     for root in &roots {
         commands.entity(root).despawn();
     }
+    // 无论切向哪个界面，离开选曲都停止主界面 BGM
+    audio.stop_menu_bgm();
 }
