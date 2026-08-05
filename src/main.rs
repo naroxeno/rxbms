@@ -4,6 +4,7 @@ mod audio;
 mod core;
 mod database;
 mod gameplay;
+mod rank;
 mod record;
 mod result;
 mod select;
