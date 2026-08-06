@@ -5,17 +5,14 @@ Bevy 0.19 BMS 铺面播放器 — 未完成事项清单。
 
 ## 优先级 P0（游玩体验关键）
 
-- [ ] **judge_level 设置未应用**
-  - 现状：`JudgeWindows::for_level(loaded.rank)` 用谱面 `#RANK` 头，设置里的"判定难度"
-    （`judge_level`，Gameplay 类）被忽略
-  - 目标：设置项生效（默认仍取谱面 rank；设置非默认时覆盖）
-  - 位置：`src/gameplay.rs`（GameplaySession.judge_windows 构造处）
+- [x] **judge_level 设置未应用**
+  - ✅ 已实现（2026-08）：设置非默认（VeryHard/Hard/Easy）时覆盖谱面 `#RANK`；
+    默认 Normal/未知 → 用谱面自带 rank（`src/gameplay.rs` setup_gameplay）
 
-- [ ] **`Box::leak` 谱面泄漏**
-  - 现状：`LoadedChart::load` 每次游玩 `Box::leak` 一份 `&'static Chart`（`src/gameplay/chart.rs:105`），
-    供 `ChartPlayer` 借用；每玩一次泄漏一份谱面数据
-  - 目标：改为 owned 播放器（ChartPlayer 持有 Chart 或生命周期管理），游玩结束释放
-  - 影响：长会话反复游玩内存增长
+- [x] **`Box::leak` 谱面泄漏**
+  - ✅ 已实现（2026-08）：`LoadedChart.chart` 改 `Arc<Chart>`，播放头用
+    `self_cell`（`ChartPlayback`）绑定 (Arc<Chart>, ChartPlayer)，随
+    GameplaySession 整体释放，无泄漏（`src/gameplay.rs`）
 
 - [ ] **y=0 事件被 bms-rs 排除**
   - 现状：`ChartPlayer.update` 用 `(Excluded(prev_y), Included(cur_y))`，start 时 `progressed_y=0`

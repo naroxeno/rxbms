@@ -14,6 +14,8 @@ serde_json = "1"
 rusqlite = { version = "0.40.1", features = ["bundled"] }
 # 递归文件搜索（fd 的底层库）：嵌套铺面目录扫描
 ignore = "0.4"
+# 自引用结构（Chart + ChartPlayer 绑定，消除 Box::leak 泄漏）
+self_cell = "1"
 # parley 依赖 icu_segmenter 时只开了 compiled_data（default-features=false），
 # 缺少日语等语言的 LSTM 分词模型 → 布局日文文本时报 "No segmentation model for language: ja"
 # 这里显式启用默认 features（compiled_data + auto/lstm），feature unification 全局生效

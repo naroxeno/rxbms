@@ -3,6 +3,7 @@
 //! 流程：选曲界面点击 → [`SelectedChart`] → 进入 Gameplay 后 [`load_chart`]
 //! 解析并处理为 [`LoadedChart`]（音符、轨道、BGM、音频路径、时长）。
 
+use std::sync::Arc;
 use std::{
     collections::HashMap,
     fs,
@@ -54,9 +55,9 @@ pub struct NoteView {
 
 /// 加载完成的谱面（Gameplay 生命周期内持有）。
 pub struct LoadedChart {
-    /// bms-rs Chart（`Box::leak` 以获得 `'static` 引用，供 `ChartPlayer` 借用；
-    /// TODO: 每游玩一次泄漏一份谱面数据，需改为 owned 播放器。
-    pub chart: &'static Chart,
+    /// bms-rs Chart（`Arc` 共享；播放头经 `ChartPlayback` self_cell 借用，
+    /// 随 GameplaySession 整体释放，无泄漏）。
+    pub chart: Arc<Chart>,
     /// 标题（结算界面/数据表使用）。
     pub title: String,
     /// `#ARTIST`。
@@ -102,7 +103,7 @@ impl LoadedChart {
         let bms = output.bms.map_err(|e| format!("解析失败: {e}"))?;
         let chart = Process::<KeyLayoutBeat>::process(&bms)
             .map_err(|e| format!("Chart 处理失败: {e}"))?;
-        let chart: &'static Chart = Box::leak(Box::new(chart));
+        let chart = Arc::new(chart);
 
         let title = bms
             .music_info
@@ -198,10 +199,10 @@ impl LoadedChart {
             .collect();
 
         // 音频路径：BMS 引用路径 → 磁盘真实路径（扩展名 fallback）
-        let wav_paths = resolve_wav_paths(path, chart);
+        let wav_paths = resolve_wav_paths(path, chart.as_ref());
 
         // BGA 数据：Base 层事件流 + 图片/视频映射
-        let bga = extract_bga(path, chart);
+        let bga = extract_bga(path, chart.as_ref());
 
         Ok(Self {
             chart,

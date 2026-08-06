@@ -2,8 +2,8 @@
 //!
 //! 玩法范围（用户约定）：7k/5k Single。
 //! 判定：LR2 默认窗口（`#RANK` → 难度），见 [`judge`]。
-//! 已实现：长音判定、血量条、皮肤化、统一设置系统。
-//! TODO：结算界面、STOP 视觉精调、Box::leak 谱面泄漏。
+//! 已实现：长音判定、血量条、皮肤化、统一设置系统、谱面 owned 播放（无泄漏）。
+//! TODO：结算界面、STOP 视觉精调。
 
 pub mod bga;
 pub mod chart;
@@ -12,9 +12,11 @@ pub mod judge;
 pub mod lane;
 pub mod render;
 
+use std::sync::Arc;
 use bevy::prelude::*;
 use bms_rs::chart::prelude::*;
 use gametime::{TimeSpan, TimeStamp};
+use bms_rs::bms::command::JudgeLevel;
 
 use crate::{
     audio::{AudioLease, AudioManager},
@@ -64,12 +66,23 @@ impl Plugin for GameplayPlugin {
 }
 
 /// 一次游玩会话的运行时状态。
+/// 谱面 + 播放头的自引用绑定（`self_cell`）：`ChartPlayer` 借用 `Arc<Chart>`，
+/// 两者同生命周期，`Drop` 时整体释放——消除旧 `Box::leak` 每游玩泄漏一份谱面。
+self_cell::self_cell! {
+    struct ChartPlayback {
+        owner: Arc<Chart>,
+        #[covariant]
+        dependent: ChartPlayer,
+    }
+}
+
 #[derive(Resource)]
 pub struct GameplaySession {
     loaded: LoadedChart,
     /// 音频租约：占用的音频路径（退出时交还 `AudioManager`）。
     lease: AudioLease,
-    player: ChartPlayer<'static>,
+    /// 播放头（谱面 + 推进状态自引用绑定，`Drop` 时整体释放，无泄漏）。
+    player: ChartPlayback,
     started_at: TimeStamp,
     /// 判定窗口（按 `#RANK`）。
     judge_windows: JudgeWindows,
@@ -141,7 +154,9 @@ pub(crate) fn setup_gameplay(
     let reaction = TimeSpan::from_duration(std::time::Duration::from_secs_f64(0.5));
     let visible_range = VisibleRangePerBpm::new(loaded.chart.init_bpm(), reaction);
     let started_at = TimeStamp::now();
-    let player = ChartPlayer::start(loaded.chart, visible_range.clone(), started_at);
+    let player = ChartPlayback::new(loaded.chart.clone(), |chart| {
+        ChartPlayer::start(chart.as_ref(), visible_range.clone(), started_at)
+    });
 
     // 视觉渲染（背景/轨道/音符/数字/文本）全部由 Lua 皮肤（SkinRuntime）接管
     let render = GameplayRender::spawn(&mut commands, &loaded);
@@ -166,7 +181,15 @@ pub(crate) fn setup_gameplay(
     let mode = loaded.play_mode();
     commands.insert_resource(GaugeState::new(loaded.total_value, loaded.note_count() as u32, gauge_type, mode));
     commands.insert_resource(LaneStates::default());
-    let judge_windows = JudgeWindows::for_level(loaded.rank);
+    // 判定难度：设置非默认（VeryHard/Hard/Easy）时覆盖谱面 #RANK；
+    // 默认 Normal / 未知 → 用谱面自带 rank（beatoraja 同款用户覆盖）。
+    let rank = match settings.get_string("judge_level", "Normal").as_str() {
+        "VeryHard" => JudgeLevel::VeryHard,
+        "Hard" => JudgeLevel::Hard,
+        "Easy" => JudgeLevel::Easy,
+        _ => loaded.rank,
+    };
+    let judge_windows = JudgeWindows::for_level(rank);
     commands.insert_resource(GameplaySession {
         loaded,
         lease,
@@ -252,11 +275,13 @@ fn tick_gameplay(
             // 剩余音频交后台解码池渐进预加载（避免游玩中主线程现解卡顿）
             audio.start_low_loading();
             session.started_at = TimeStamp::now();
-            session.player = ChartPlayer::start(
-                session.loaded.chart,
-                session.visible_range.clone(),
-                session.started_at,
-            );
+            session.player = ChartPlayback::new(session.loaded.chart.clone(), |chart| {
+                ChartPlayer::start(
+                    chart.as_ref(),
+                    session.visible_range.clone(),
+                    session.started_at,
+                )
+            });
             session.loading = false;
         } else {
             return;
@@ -265,7 +290,7 @@ fn tick_gameplay(
 
     // 推进播放头，收集触发事件（音频经解码缓存 + mixer 并发 push，主线程零阻塞）
     let now = TimeStamp::now();
-    let events = session.player.update(now);
+    let events = session.player.with_dependent_mut(|_, p| p.update(now));
     for e in &events {
         match &e.event {
             ChartEvent::Note {
@@ -356,7 +381,7 @@ fn hold_update(
     if session.loading || session.exiting {
         return;
     }
-    let now_y = session.player.playback_state().progressed_y.0.as_f64();
+    let now_y = session.player.with_dependent(|_, p| p.playback_state().progressed_y.0.as_f64());
     let now_sec = TimeStamp::now()
         .elapsed_since(session.started_at)
         .as_secs_f64();
@@ -666,9 +691,12 @@ fn sync_skin_state(
     mut runtime: Option<NonSendMut<crate::skin::runtime::SkinRuntime>>,
 ) {
     let Some(runtime) = runtime.as_deref_mut() else { return };
-    let ps = session.player.playback_state();
-    let now_y = ps.progressed_y.0.as_f64();
-    let visible_y = session.player.visible_window_y(ps.current_speed).0.as_f64();
+    let (now_y, visible_y, bpm_now) = session.player.with_dependent(|_, p| {
+        let ps = p.playback_state();
+        let ny = ps.progressed_y.0.as_f64();
+        let vy = p.visible_window_y(ps.current_speed).0.as_f64();
+        (ny, vy, ps.current_bpm.as_f64())
+    });
     let mut st = match runtime.state.write() {
         Ok(s) => s,
         Err(_) => return,
@@ -685,7 +713,7 @@ fn sync_skin_state(
     // 玩家下落速度倍率（settings scroll_speed）；#SPEED 谱面速度已由
     // progressed_y 推进体现，勿乘 current_speed 避免双重加倍
     st.hispeed = store.get_float("scroll_speed", 1.0) as f64;
-    st.bpm_now = ps.current_bpm.as_f64();
+    st.bpm_now = bpm_now;
     st.bpm_min = data.initial_bpm;
     st.bpm_max = data.initial_bpm;
     st.duration_sec = data.duration_sec;
