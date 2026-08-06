@@ -305,8 +305,11 @@ pub fn apply_skin_frame(
         let slot_idx = if let Some(&i) = runtime.slot_map.get(&cmd.id) {
             i
         } else {
-            // 特效槽（blend=2 黑底图 / BGA 帧）→ Mesh2d + 自定义材质（GPU 抠像/重排）
-            let is_fx = cmd.blend == 2 || cmd.src == "__bga__";
+            // 特效槽（blend=2 黑底图）→ Mesh2d + 自定义材质（GPU 抠像）。
+            // BGA 帧（`__bga__`）走 Sprite：整图无裁剪，Sprite 直渲已验证稳定（
+            // 视频帧 RGBA 上传 + 普通采样，不做通道重排——bevy 无 3 通道格式，
+            // swap 场景收益≈0）。
+            let is_fx = cmd.blend == 2;
             let e = if is_fx {
                 let fx_handle = fx_material_for(
                     cmd,
