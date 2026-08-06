@@ -354,28 +354,61 @@ fn row_to_meta(row: &rusqlite::Row<'_>) -> rusqlite::Result<SongMeta> {
 }
 
 /// 扫描单个目录：解析新/变化的铺面并 upsert，清理已消失的记录。
+/// 扫描一个配置的铺面根目录（**递归嵌套**，fd/ignore 搜索）。
+///
+/// 叶子规则：遇到**含 BMS 铺面文件的目录**即停止探索其子文件夹——铺面文件
+/// 所在目录即叶子，不深入更深的层级（等价于"有效铺面 = 父目录内含 BMS 文件"）。
 fn scan_folder(tx: &rusqlite::Transaction<'_>, folder: &Path, report: &mut ScanReport) {
-    let dir_str = folder.to_string_lossy().into_owned();
-    let Ok(entries) = fs::read_dir(folder) else {
-        warn!("[song-database] 无法读取目录: {}", folder.display());
-        report.failed += 1;
-        return;
-    };
+    // 1) 全量收集 BMS 文件（ignore = fd 的搜索内核，递归并行、隐藏文件等过滤）
+    let mut chart_dirs: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    let mut chart_files: Vec<PathBuf> = Vec::new();
+    {
+        let mut builder = ignore::WalkBuilder::new(folder);
+        builder
+            .standard_filters(false) // BMS 目录可能以 `.` 开头，不禁用隐藏/忽略规则
+            .follow_links(false)
+            .hidden(false);
+        for entry in builder.build() {
+            let Ok(entry) = entry else {
+                report.failed += 1;
+                continue;
+            };
+            let path = entry.path();
+            if entry.file_type().is_some_and(|t| t.is_file()) && is_chart_file(path) {
+                if let Some(parent) = path.parent() {
+                    chart_dirs.insert(parent.to_path_buf());
+                }
+                chart_files.push(path.to_path_buf());
+            }
+        }
+    }
 
-    // 磁盘上实际存在的铺面路径集合
+    // 2) 叶子规则过滤：有效铺面 = 父目录是"从 root 到父目录的路径上**第一个**
+    //    含 BMS 的目录"（递归遇到含 BMS 目录即停止；父目录的含 BMS 祖先会挡住它）。
     let mut on_disk: std::collections::HashSet<String> = std::collections::HashSet::new();
-
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if !path.is_file() || !is_chart_file(&path) {
+    for path in chart_files {
+        let parent = path.parent().expect("文件必有父目录");
+        if !chart_dirs.contains(parent) {
+            continue; // 父目录无 BMS（必在含 BMS 祖先的子目录 → 被叶子规则排除）
+        }
+        // 父目录的任何含 BMS 祖先都会阻止探索到该目录 → 排除
+        let mut blocked = false;
+        let mut ancestor = parent.parent();
+        while let Some(a) = ancestor {
+            if chart_dirs.contains(a) {
+                blocked = true;
+                break;
+            }
+            ancestor = a.parent();
+        }
+        if blocked {
             continue;
         }
         let path_str = path.to_string_lossy().into_owned();
         on_disk.insert(path_str.clone());
 
         // 增量：mtime 未变则跳过
-        let mtime = entry
-            .metadata()
+        let mtime = std::fs::metadata(&path)
             .and_then(|m| m.modified())
             .ok()
             .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
@@ -474,7 +507,8 @@ fn scan_folder(tx: &rusqlite::Transaction<'_>, folder: &Path, report: &mut ScanR
         }
     }
 
-    // 清理已消失的铺面记录
+    // 清理已消失的铺面记录（按根目录前缀匹配，覆盖嵌套层级）
+    let dir_str = folder.to_string_lossy().into_owned();
     let stale_result = tx
         .prepare(
             "SELECT path FROM songs
@@ -688,9 +722,38 @@ mod tests {
         assert_eq!(decode_bms("hello".as_bytes()), "hello");
     }
 
+    /// 嵌套目录 + 叶子规则：含 BMS 的目录不再深入其子文件夹。
     #[test]
-    fn songs_db_roundtrip() {
-        let _temp = TempDb::new("roundtrip");
+    fn nested_scan_stops_at_chart_dirs() {
+        let _temp = TempDb::new("nested");
+        // root/a/x.bms + root/a/sub/y.bms + root/b/z.bms
+        let root = _temp.0.join("root");
+        let a = root.join("a");
+        let sub = a.join("sub");
+        let b = root.join("b");
+        for d in [&a, &sub, &b] {
+            fs::create_dir_all(d).unwrap();
+        }
+        fs::write(a.join("x.bms"), MINI_BMS).unwrap();
+        fs::write(sub.join("y.bms"), MINI_BMS).unwrap();
+        fs::write(b.join("z.bms"), MINI_BMS).unwrap();
+
+        let db = SongsDb::open_at(_temp.db_path()).expect("打开数据库");
+        db.add_folder(&root).expect("添加根目录");
+        let report = db.scan().expect("扫描");
+        // 叶子规则：x（父目录 a 含 BMS）✓、z（父目录 b 含 BMS）✓；
+        // y 在 a 的子目录 sub（sub 自身无 BMS，但其祖先 a 含 BMS）→ 排除
+        assert_eq!(report.added, 2, "应只收录 x/z: {report}");
+
+        let songs = db.list_songs().expect("查询铺面");
+        let names: Vec<String> = songs.iter().map(|s| s.file_name.clone()).collect();
+        assert!(names.contains(&"x.bms".to_string()));
+        assert!(names.contains(&"z.bms".to_string()));
+        assert!(!names.contains(&"y.bms".to_string()), "a/sub 不应被深入: {names:?}");
+    }
+
+    #[test]
+    fn songs_db_roundtrip() {        let _temp = TempDb::new("roundtrip");
 
         // 准备一个临时铺面目录 + 迷你铺面
         let chart_dir = _temp.0.join("charts");
