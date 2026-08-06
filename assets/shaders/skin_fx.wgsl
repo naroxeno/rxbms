@@ -6,6 +6,10 @@
     mesh2d_view_bindings::view,
 }
 
+#ifdef SRGB_OUTPUT
+#import bevy_render::color_operations::linear_to_srgb
+#endif
+
 struct SkinFxMaterial {
     flags: u32,
     _pad0: u32,
@@ -36,5 +40,13 @@ fn fragment(
     if ((material.flags & FLAG_BLACK_KEY) != 0u && c.r == 0.0 && c.g == 0.0 && c.b == 0.0) {
         c.a = 0.0;
     }
+    // luma-key：按亮度淡出（比纯黑抠像平滑，消除特效圆形的抗锯齿黑圈）
+    if ((material.flags & FLAG_LUMA_KEY) != 0u) {
+        let luma = max(c.r, max(c.g, c.b));
+        c.a = min(c.a, luma);
+    }
+#ifdef SRGB_OUTPUT
+    c = vec4(linear_to_srgb(c.rgb), c.a);
+#endif
     return c;
 }

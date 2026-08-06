@@ -23,6 +23,9 @@ pub const SKIN_FX_SHADER_PATH: &str = "shaders/skin_fx.wgsl";
 pub const FLAG_BLACK_KEY: u32 = 1 << 0;
 /// 特效标志：RGB 通道重排（BGR/BRG → RGB，BGA 帧用）。
 pub const FLAG_SWAP_RGB: u32 = 1 << 1;
+/// 特效标志：luma-key 亮度淡出（`alpha = min(a, 亮度)`）——比纯黑抠像更平滑，
+/// 抗锯齿灰边按亮度淡出，消除圆形特效的黑圈。
+pub const FLAG_LUMA_KEY: u32 = 1 << 2;
 
 /// 材质 uniform（与 WGSL `SkinFxMaterial` 布局一致：4×u32 + vec4 = 32 字节）。
 ///

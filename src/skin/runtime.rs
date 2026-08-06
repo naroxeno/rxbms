@@ -273,9 +273,13 @@ pub fn apply_skin_frame(
     let cmds = evaluate_frame(&runtime.desc, &runtime.config, &runtime.state, &runtime.src_sizes);
     let vs = runtime.screen;
 
-    // 1) 先隐藏全部槽
-    for &e in &runtime.slots {
-        if let Ok((_, _, _, mut vis)) = q.get_mut(e) {
+    // 1) 先隐藏全部槽（Sprite 槽走 q；特效槽走 mq——Mesh2d 无 Sprite 组件）
+    for (i, &e) in runtime.slots.iter().enumerate() {
+        if runtime.slot_fx[i] {
+            if let Ok((_, _, _, mut vis)) = mq.get_mut(e) {
+                *vis = Visibility::Hidden;
+            }
+        } else if let Ok((_, _, _, mut vis)) = q.get_mut(e) {
             *vis = Visibility::Hidden;
         }
     }
@@ -413,7 +417,7 @@ fn fx_material_for(
     >,
     fx_materials: &mut Assets<crate::skin::material::SkinFxMaterial>,
 ) -> Handle<crate::skin::material::SkinFxMaterial> {
-    use crate::skin::material::{FLAG_BLACK_KEY, FLAG_SWAP_RGB, SkinFxMaterial, SkinFxUniform};
+    use crate::skin::material::{FLAG_LUMA_KEY, FLAG_SWAP_RGB, SkinFxMaterial, SkinFxUniform};
     let uv = (cmd.uv.min.x, cmd.uv.min.y, cmd.uv.max.x, cmd.uv.max.y);
     let key = (cmd.src.clone(), uv.0, uv.1, uv.2, uv.3);
     if let Some(h) = fx_cache.get(&key) {
@@ -422,7 +426,8 @@ fn fx_material_for(
     let flags = if cmd.src == "__bga__" {
         FLAG_SWAP_RGB
     } else {
-        FLAG_BLACK_KEY
+        // 黑底特效图：luma-key 亮度淡出（比纯黑抠像平滑，消除圆形黑边）
+        FLAG_LUMA_KEY
     };
     let uniform = if uv == (0, 0, 0, 0) {
         SkinFxUniform::full(flags)
