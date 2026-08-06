@@ -20,6 +20,7 @@ struct SkinFxMaterial {
 
 const FLAG_BLACK_KEY: u32 = 1u;
 const FLAG_SWAP_RGB: u32 = 2u;
+const FLAG_LUMA_KEY: u32 = 4u;
 
 @group(#{MATERIAL_BIND_GROUP}) @binding(0) var<uniform> material: SkinFxMaterial;
 @group(#{MATERIAL_BIND_GROUP}) @binding(1) var texture: texture_2d<f32>;
