@@ -430,7 +430,9 @@ fn fx_material_for(
         let (iw, ih) = src_sizes.get(&cmd.src).copied().unwrap_or((1, 1));
         SkinFxUniform {
             flags,
-            _pad: [0; 3],
+            _pad0: 0,
+            _pad1: 0,
+            _pad2: 0,
             uv_rect: Vec4::new(
                 uv.0 as f32 / iw as f32,
                 uv.1 as f32 / ih as f32,

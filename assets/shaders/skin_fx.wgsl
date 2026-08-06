@@ -8,7 +8,9 @@
 
 struct SkinFxMaterial {
     flags: u32,
-    _pad0: vec3<f32>,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
     uv_rect: vec4<f32>, // min.xy, max.xy（0..1）
 };
 

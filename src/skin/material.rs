@@ -24,12 +24,17 @@ pub const FLAG_BLACK_KEY: u32 = 1 << 0;
 /// 特效标志：RGB 通道重排（BGR/BRG → RGB，BGA 帧用）。
 pub const FLAG_SWAP_RGB: u32 = 1 << 1;
 
-/// 材质 uniform（与 WGSL `SkinFxMaterial` 布局一致：u32 + pad + vec4 = 32 字节）。
+/// 材质 uniform（与 WGSL `SkinFxMaterial` 布局一致：4×u32 + vec4 = 32 字节）。
+///
+/// 不用数组填充（encase 要求 uniform 数组 stride 为 16 的倍数）。
 #[derive(ShaderType, Clone, Copy, Debug)]
 pub struct SkinFxUniform {
     /// 特效标志位。
     pub flags: u32,
-    pub _pad: [u32; 3],
+    /// 填充（对齐 uv_rect 到 16 字节）。
+    pub _pad0: u32,
+    pub _pad1: u32,
+    pub _pad2: u32,
     /// 采样区域（0..1 的 min.x, min.y, max.x, max.y；整图为 (0,0,1,1)）。
     pub uv_rect: Vec4,
 }
@@ -40,7 +45,9 @@ impl SkinFxUniform {
     pub fn full(flags: u32) -> Self {
         Self {
             flags,
-            _pad: [0; 3],
+            _pad0: 0,
+            _pad1: 0,
+            _pad2: 0,
             uv_rect: Vec4::new(0.0, 0.0, 1.0, 1.0),
         }
     }
