@@ -19,13 +19,14 @@
 //! 引用计数，缓存对象改为 kira 的 `StaticSoundData`（克隆零拷贝）。
 //! 自写 cpal 混音器与 Symphonia 解码池删除（kira 内部实现，见 Cargo.toml 注释）。
 
+pub mod decode;
 pub mod metronome;
+pub mod track;
 
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
-    sync::{mpsc, Arc, Condvar, Mutex},
-    thread,
+    sync::{mpsc, Mutex},
 };
 
 use bevy::prelude::*;
@@ -38,12 +39,15 @@ use kira::{
         static_sound::StaticSoundData,
         streaming::{StreamingSoundData, StreamingSoundHandle},
     },
-    track::{TrackBuilder, TrackHandle},
 };
 
 use crate::core::settings::SettingsStore;
 
-use self::metronome::{MetronomeData, MetronomeHandle};/// LRU 缓存上限（引用归零后仍保留的音频数）。
+use self::decode::DecodePool;
+use self::metronome::{MetronomeData, MetronomeHandle};
+use self::track::Tracks;
+
+/// LRU 缓存上限（引用归零后仍保留的音频数）。
 ///
 /// 每个音频在缓存生命周期内只解码一次；上限取 512 覆盖常见谱面的音频规模，
 /// 减少跨游玩（LRU 淘汰后重进）时的重复解码。
@@ -60,72 +64,6 @@ const STREAMING_MIN_BYTES: u64 = 2_000_000;
 /// 同一文件被超过该次数的事件触发（循环采样/密集 BGM 序列）即使文件够大
 /// 也走静态缓存——否则每次事件停旧流重开，背景音被掐断。
 const STREAMING_MAX_EVENTS: usize = 8;
-
-/// 后台解码线程池：worker 线程构造 `StaticSoundData`（kira 无后台解码 API，但
-/// `from_file` 是纯 CPU 解码，可在工作线程执行；结果送回主线程缓存）。
-///
-/// 谱面剩余音频（首批之外）在此渐进解码，避免游玩中 `play_synced` 主线程现解卡顿。
-struct DecodePool {
-    tasks: Arc<Mutex<VecDeque<PathBuf>>>,
-    condvar: Arc<Condvar>,
-    #[allow(dead_code)] // 持有句柄保持线程存活（进程退出时随进程结束）
-    _handles: Vec<thread::JoinHandle<()>>,
-}
-
-/// 后台解码线程数。 TODO: to make this configurable
-const DECODE_THREADS: usize = 4;
-
-impl DecodePool {
-    fn new(tx: mpsc::Sender<(PathBuf, Option<StaticSoundData>)>) -> Self {
-        let tasks: Arc<Mutex<VecDeque<PathBuf>>> = Arc::new(Mutex::new(VecDeque::new()));
-        let condvar = Arc::new(Condvar::new());
-        let mut handles = Vec::new();
-        for _ in 0..DECODE_THREADS {
-            let tasks = tasks.clone();
-            let condvar = condvar.clone();
-            let tx = tx.clone();
-            handles.push(thread::spawn(move || loop {
-                // 取一个任务（空队列时阻塞等待）
-                let path = {
-                    let mut q = match tasks.lock() {
-                        Ok(q) => q,
-                        Err(_) => return,
-                    };
-                    loop {
-                        if let Some(p) = q.pop_front() {
-                            break p;
-                        }
-                        // 空队列：等待唤醒（wait 原子释放锁，唤醒后重新拿锁）
-                        match condvar.wait(q) {
-                            Ok(q2) => q = q2,
-                            Err(_) => return,
-                        }
-                    }
-                };
-                let result = StaticSoundData::from_file(&path).ok();
-                if tx.send((path, result)).is_err() {
-                    break; // 接收端已销毁（应用退出）
-                }
-            }));
-        }
-        Self {
-            tasks,
-            condvar,
-            _handles: handles,
-        }
-    }
-
-    /// 提交一个解码任务。
-    fn submit(&self, path: PathBuf) {
-        let mut q = match self.tasks.lock() {
-            Ok(q) => q,
-            Err(_) => return,
-        };
-        q.push_back(path);
-        drop(q);
-        self.condvar.notify_one();
-    }
-}
 
 /// 全局音频管理器（Resource）。
 #[derive(Resource)]
@@ -156,62 +94,6 @@ pub struct AudioManager {
     volume: f32,
 }
 
-/// 全部 kira 音轨的统一管理（main → {menu, metronome, bgm, keysound} 分层）。
-///
-/// - **常驻轨**（menu/metronome）：与 [`AudioManager`] 同生命周期；
-/// - **每场铺面轨**（bgm/keysound）：`begin_song` 时创建，`stop_all` 时 take + drop
-///   销毁（`TrackHandle` 的 `Drop` → `mark_for_removal`，轨道上的**所有声音**
-///   随之停止，不残留到下一场）。
-struct Tracks {
-    /// 主界面（选曲/标题）BGM 轨，独立于 gameplay 生命周期。
-    menu: TrackHandle,
-    /// 节拍器专用轨道（常驻合成音，独立于键音轨，避免污染 `is_playing`
-    /// 对键音轨 `num_sounds` 的判定）。
-    metronome: TrackHandle,
-    /// 本场铺面 BGM 轨（流式播放）。
-    bgm: Option<TrackHandle>,
-    /// 本场铺面键音轨（静态采样，多路并发：键音 + 小 BGM 事件）。
-    keysound: Option<TrackHandle>,
-}
-
-impl Tracks {
-    /// 创建常驻轨道（menu + metronome）。
-    fn new(kira: &mut kira::AudioManager<DefaultBackend>) -> Result<Self, String> {
-        let menu = kira
-            .add_sub_track(TrackBuilder::default())
-            .map_err(|_| "创建主界面音轨失败".to_string())?;
-        let metronome = kira
-            .add_sub_track(TrackBuilder::default())
-            .map_err(|_| "创建节拍器轨道失败".to_string())?;
-        Ok(Self {
-            menu,
-            metronome,
-            bgm: None,
-            keysound: None,
-        })
-    }
-
-    /// 确保本场铺面的播放轨道已创建（上一场 `destroy_song_tracks` 销毁后重建）。
-    fn ensure_song_tracks(&mut self, kira: &mut kira::AudioManager<DefaultBackend>) {
-        if self.bgm.is_some() {
-            return;
-        }
-        match kira.add_sub_track(TrackBuilder::default()) {
-            Ok(bgm) => self.bgm = Some(bgm),
-            Err(e) => warn!("[audio] 创建 BGM 轨道失败: {e}"),
-        }
-        match kira.add_sub_track(TrackBuilder::default()) {
-            Ok(keysound) => self.keysound = Some(keysound),
-            Err(e) => warn!("[audio] 创建键音轨道失败: {e}"),
-        }
-    }
-
-    /// 销毁本场铺面的播放轨道（轨道上的全部声音随之停止）。
-    fn destroy_song_tracks(&mut self) {
-        self.bgm = None;
-        self.keysound = None;
-    }
-}
 
 impl AudioManager {
     /// 打开默认输出设备并初始化 kira（三条轨道 + 谱面时钟 + 节拍器）。
