@@ -114,6 +114,12 @@ impl BgaPlayer {
         self.current_image.clone()
     }
 
+    /// BGA 视频是否仍在播放（未到 EOF；谱面播完后用于等待视频尾巴播完）。
+    #[must_use]
+    pub fn is_playing(&self) -> bool {
+        self.video.as_ref().is_some_and(|v| !v.eof)
+    }
+
     /// 每帧更新：触发事件切换 + 视频帧推进。
     pub fn update(
         &mut self,

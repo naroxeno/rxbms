@@ -92,7 +92,9 @@ pub struct GameplaySession {
 struct GameplayLoadFailed;
 
 /// 退出时等待 BGM 播完的超时（秒，防止长采样卡住）。
-const EXIT_TIMEOUT_SECS: f64 = 5.0;
+/// 谱面播完后的退出等待超时（等 BGM/视频自然播完；超时兜底防挂）。
+/// 30s 覆盖常见 BGA 视频尾部；EOF 后立即退出不受此限制。
+const EXIT_TIMEOUT_SECS: f64 = 30.0;
 
 // ---------- 界面构建 ----------
 
@@ -198,6 +200,7 @@ fn tick_gameplay(
     mut lanes: ResMut<LaneStates>,
     mut gauge: ResMut<GaugeState>,
     mut audio: ResMut<AudioManager>,
+    bga: Res<BgaPlayer>,
 ) {
     // 加载失败 → 回选曲
     if load_failed.is_some() {
@@ -206,16 +209,16 @@ fn tick_gameplay(
         return;
     }
 
-    // 完成铺面后的退出等待：等当前 BGM 自然播完再回选曲（超时兜底）。
-    // 只有"完成铺面"会进入此分支；中途退出（ESC/失败）已直接释放音频。
-    // 注意：若 BGM 已播完（短于谱面或未触发），下一帧即返回，不强制停留。
+    // 完成铺面后的退出等待：等当前 BGM **与 BGA 视频**都自然播完再回选曲
+    // （超时兜底防挂）。只有"完成铺面"会进入此分支；中途退出（ESC/失败）
+    // 已直接释放。注意：若两者均已播完，下一帧即返回，不强制停留。
     if session.exiting {
         let now = TimeStamp::now();
         let timeout = now
             .elapsed_since(session.exit_requested_at)
             .as_secs_f64()
             > EXIT_TIMEOUT_SECS;
-        if !audio.is_playing() || timeout {
+        if (!audio.is_playing() && !bga.is_playing()) || timeout {
             audio.stop_all(); // 兜底清理
             NextState::set_if_neq(&mut next, AppState::SongSelect);
         }
@@ -887,15 +890,16 @@ fn sync_skin_state(
     }
 }
 
-/// 血条渲染更新：宽度和颜色随血量变化。
 /// BGA 更新：事件触发切换 + 视频帧推进（渲染由皮肤 destination 完成）。
+///
+/// **谱面播完（exiting）后继续推进**——结尾演出/视频尾巴应播完再回选曲。
 fn update_bga(
     mut bga: ResMut<BgaPlayer>,
     session: Res<GameplaySession>,
     asset_server: Res<AssetServer>,
     mut images: ResMut<Assets<Image>>,
 ) {
-    if session.loading || session.exiting {
+    if session.loading {
         return;
     }
     let now_sec = TimeStamp::now()
