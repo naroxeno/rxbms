@@ -5,6 +5,7 @@
 //! 皮肤加载失败时回退为纯色背景 + 错误提示（runtime::load_lua_skin）。
 
 pub mod lua;
+pub mod material;
 pub mod model;
 pub mod render;
 pub mod runtime;
@@ -19,6 +20,8 @@ pub struct SkinPlugin;
 
 impl Plugin for SkinPlugin {
     fn build(&self, app: &mut App) {
+        // 皮肤特效材质（black-key 抠像 / RGB 通道重排）
+        app.add_plugins(bevy::sprite_render::Material2dPlugin::<material::SkinFxMaterial>::default());
         // 皮肤按谱面模式加载（5K→Play5 / 7K→Play7），须在 setup_gameplay 之后
         app.add_systems(
             OnEnter(AppState::Gameplay),

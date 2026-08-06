@@ -24,7 +24,7 @@ use bevy::{
 use crate::core::settings::SettingsStore;
 use crate::skin::lua::{LuaSkin, SkinConfigValues, SkinHeader};
 use crate::skin::model::{Destination, SkinDesc, TextDef, resolve_wildcard};
-use crate::skin::render::{VirtualScreen, evaluate_frame, frame_at};
+use crate::skin::render::{DrawCmd, VirtualScreen, evaluate_frame, frame_at};
 use crate::skin::state::{PlayState, install_main_state};
 
 /// 皮肤运行时（NonSend resource）。
@@ -53,10 +53,17 @@ pub struct SkinRuntime {
     pub slot_map: HashMap<u64, usize>,
     /// 每槽当前绑定的 uv（切帧时据此换 atlas index，layout 不变）。
     pub slot_uvs: Vec<URect>,
+    /// 每槽是否特效槽（`blend=2` / BGA 帧 → Mesh2d + 自定义材质）。
+    pub slot_fx: Vec<bool>,
     /// source id → (静态 atlas layout, uv→index 表)：同 source 合批、切帧只改 index。
     pub atlas: HashMap<
         String,
         (Handle<TextureAtlasLayout>, HashMap<(u32, u32, u32, u32), u32>),
+    >,
+    /// 特效材质缓存：(src, uv) → 材质句柄（同源同帧复用，切帧查/建）。
+    pub fx_cache: HashMap<
+        (String, u32, u32, u32, u32),
+        Handle<crate::skin::material::SkinFxMaterial>,
     >,
     /// 纹理是否全部就绪（已建槽池）。
     pub ready: bool,
@@ -162,7 +169,9 @@ pub fn load_lua_skin(world: &mut World) {
         slots: Vec::new(),
         slot_map: HashMap::new(),
         slot_uvs: Vec::new(),
+        slot_fx: Vec::new(),
         atlas: HashMap::new(),
+        fx_cache: HashMap::new(),
         ready: false,
         src_sizes: HashMap::new(),
         screen: VirtualScreen::fit(1920.0, 1080.0, 1280.0, 720.0),
@@ -176,13 +185,25 @@ pub fn apply_skin_frame(
     mut runtime: Option<NonSendMut<SkinRuntime>>,
     mut atlas_layouts: ResMut<Assets<TextureAtlasLayout>>,
     mut images: ResMut<Assets<Image>>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut fx_materials: ResMut<Assets<crate::skin::material::SkinFxMaterial>>,
     fonts: Res<Assets<Font>>,
     bga: Res<crate::gameplay::bga::BgaPlayer>,
     window_q: Query<&Window>,
-    // 注意：两个 Query 都改 Transform/Visibility，须用 Without 拆开（B0001）
+    // 注意：三个 Query 都改 Transform/Visibility，须用 Without 拆开（B0001）
     mut q: Query<
         (Entity, &mut Sprite, &mut Transform, &mut Visibility),
         Without<Text2d>,
+    >,
+    // 特效槽（Mesh2d + 自定义材质：black-key 抠像 / RGB 重排）
+    mut mq: Query<
+        (
+            Entity,
+            &mut MeshMaterial2d<crate::skin::material::SkinFxMaterial>,
+            &mut Transform,
+            &mut Visibility,
+        ),
+        (Without<Sprite>, Without<Text2d>),
     >,
     mut tq: Query<
         (
@@ -208,30 +229,13 @@ pub fn apply_skin_frame(
         if !all_ready {
             return;
         }
-        // 加色混合（blend=2）特效图的 CPU 近似：黑底 RGB 图（如 Bomb/Default.png 无 alpha
-        // 通道）用 luma-key 抠像——`alpha = 亮度 × 原alpha / 255`。比"只抠纯黑"更强：
-        // 抗锯齿灰边（如 (30,30,30)）会按亮度淡出，不再残留一圈黑/灰边。
-        // beatoraja 用真 GPU 加色混合（黑底完全不显示），这里以 alpha 混合近似。
-        // judge 弹字（judge_objects）若声明 blend=2 同样处理。
-        let additive: std::collections::HashSet<String> = runtime
-            .desc
-            .destinations
-            .iter()
-            .chain(runtime.desc.judge_objects.iter())
-            .filter(|d| d.blend == 2)
-            .filter_map(|d| runtime.desc.image(&d.id).map(|img| img.src.clone()))
-            .collect();
+        // 记录源图尺寸（帧动画裁剪 / 特效槽 uv_rect 换算用）。
+        // blend=2 黑底特效图不再做 CPU 抠像——已改由 GPU shader
+        // （SkinFxMaterial FLAG_BLACK_KEY，beatoraja layer.frag 语义）处理。
         for (id, h) in &runtime.textures {
-            if let Some(mut img) = images.get_mut(h) {
+            if let Some(img) = images.get(h) {
                 let s = img.size();
                 runtime.src_sizes.insert(id.clone(), (s.x, s.y));
-                if additive.contains(id)
-                    && let Some(data) = &mut img.data
-                {
-                    for px in data.chunks_exact_mut(4) {
-                        px[3] = luma_key_alpha(px[0], px[1], px[2], px[3]);
-                    }
-                }
             }
         }
         // 构建每 source 静态 atlas（同 source 合批 + 切帧只改 index，不重建 layout）
@@ -297,24 +301,52 @@ pub fn apply_skin_frame(
         let slot_idx = if let Some(&i) = runtime.slot_map.get(&cmd.id) {
             i
         } else {
-            let e = commands
-                .spawn((
-                    Sprite {
-                        image: handle.clone(),
-                        custom_size: Some(Vec2::new(cmd.w * vs.scale, cmd.h * vs.scale)),
-                        ..default()
-                    },
-                    Transform::from_xyz(
-                        vs.world_x(cmd.x + cmd.w / 2.0),
-                        vs.world_y(cmd.y + cmd.h / 2.0),
-                        cmd.z as f32 * 0.01,
-                    ),
-                    Visibility::Hidden,
-                ))
-                .id();
+            // 特效槽（blend=2 黑底图 / BGA 帧）→ Mesh2d + 自定义材质（GPU 抠像/重排）
+            let is_fx = cmd.blend == 2 || cmd.src == "__bga__";
+            let e = if is_fx {
+                let fx_handle = fx_material_for(
+                    cmd,
+                    &handle,
+                    &runtime.src_sizes,
+                    &mut runtime.fx_cache,
+                    &mut fx_materials,
+                );
+                commands
+                    .spawn((
+                        Mesh2d(meshes.add(Rectangle::new(
+                            cmd.w * vs.scale,
+                            cmd.h * vs.scale,
+                        ))),
+                        MeshMaterial2d::<crate::skin::material::SkinFxMaterial>(fx_handle),
+                        Transform::from_xyz(
+                            vs.world_x(cmd.x + cmd.w / 2.0),
+                            vs.world_y(cmd.y + cmd.h / 2.0),
+                            cmd.z as f32 * 0.01,
+                        ),
+                        Visibility::Hidden,
+                    ))
+                    .id()
+            } else {
+                commands
+                    .spawn((
+                        Sprite {
+                            image: handle.clone(),
+                            custom_size: Some(Vec2::new(cmd.w * vs.scale, cmd.h * vs.scale)),
+                            ..default()
+                        },
+                        Transform::from_xyz(
+                            vs.world_x(cmd.x + cmd.w / 2.0),
+                            vs.world_y(cmd.y + cmd.h / 2.0),
+                            cmd.z as f32 * 0.01,
+                        ),
+                        Visibility::Hidden,
+                    ))
+                    .id()
+            };
             let i = runtime.slots.len();
             runtime.slots.push(e);
             runtime.slot_map.insert(cmd.id, i);
+            runtime.slot_fx.push(is_fx);
             // 哨兵：强制首次更新时绑定 atlas（否则无裁剪显示整图）
             runtime
                 .slot_uvs
@@ -323,7 +355,24 @@ pub fn apply_skin_frame(
         };
 
         let e = runtime.slots[slot_idx];
-        if let Ok((_, mut sprite, mut tf, mut vis)) = q.get_mut(e) {
+        // 特效槽：更新材质（切帧换 handle）+ 位置；普通槽：Sprite 更新
+        if runtime.slot_fx[slot_idx] {
+            if let Ok((_, mut mat, mut tf, mut vis)) = mq.get_mut(e) {
+                mat.0 = fx_material_for(
+                    cmd,
+                    &handle,
+                    &runtime.src_sizes,
+                    &mut runtime.fx_cache,
+                    &mut fx_materials,
+                );
+                tf.translation = Vec3::new(
+                    vs.world_x(cmd.x + cmd.w / 2.0),
+                    vs.world_y(cmd.y + cmd.h / 2.0),
+                    cmd.z as f32 * 0.01,
+                );
+                *vis = Visibility::Visible;
+            }
+        } else if let Ok((_, mut sprite, mut tf, mut vis)) = q.get_mut(e) {
             // uv 变化（帧动画切帧）→ 换 atlas index（layout 固定，同 source 合批）
             if runtime.slot_uvs[slot_idx] != cmd.uv {
                 if let Some((layout, index_map)) = runtime.atlas.get(&cmd.src) {
@@ -349,13 +398,53 @@ pub fn apply_skin_frame(
     }
 }
 
-/// luma-key 抠像：返回处理后的 alpha（blend=2 特效图的 CPU 加色近似）。
-/// `alpha = min(原alpha, 亮度)`——纯黑（亮度 0）全透明，抗锯齿灰边按亮度淡出。
-/// 用 `min` 而非乘法保证**幂等**：皮肤重载（asset 复用同一张 Image）时
-/// 重复处理结果不变，不会二次衰减。
-fn luma_key_alpha(r: u8, g: u8, b: u8, a: u8) -> u8 {
-    let luma = (r as u32 * 299 + g as u32 * 587 + b as u32 * 114) / 1000;
-    a.min(luma as u8)
+
+/// 特效槽材质：按 (src, uv) 缓存查/建 `SkinFxMaterial`。
+///
+/// - BGA 帧（`__bga__`）：`FLAG_SWAP_RGB`（3 通道 RGB 上传，GPU 重排）；
+/// - `blend=2` 黑底特效图：`FLAG_BLACK_KEY`（纯黑抠像），帧动画裁剪经 `uv_rect`。
+fn fx_material_for(
+    cmd: &DrawCmd,
+    handle: &Handle<Image>,
+    src_sizes: &std::collections::HashMap<String, (u32, u32)>,
+    fx_cache: &mut std::collections::HashMap<
+        (String, u32, u32, u32, u32),
+        Handle<crate::skin::material::SkinFxMaterial>,
+    >,
+    fx_materials: &mut Assets<crate::skin::material::SkinFxMaterial>,
+) -> Handle<crate::skin::material::SkinFxMaterial> {
+    use crate::skin::material::{FLAG_BLACK_KEY, FLAG_SWAP_RGB, SkinFxMaterial, SkinFxUniform};
+    let uv = (cmd.uv.min.x, cmd.uv.min.y, cmd.uv.max.x, cmd.uv.max.y);
+    let key = (cmd.src.clone(), uv.0, uv.1, uv.2, uv.3);
+    if let Some(h) = fx_cache.get(&key) {
+        return h.clone();
+    }
+    let flags = if cmd.src == "__bga__" {
+        FLAG_SWAP_RGB
+    } else {
+        FLAG_BLACK_KEY
+    };
+    let uniform = if uv == (0, 0, 0, 0) {
+        SkinFxUniform::full(flags)
+    } else {
+        let (iw, ih) = src_sizes.get(&cmd.src).copied().unwrap_or((1, 1));
+        SkinFxUniform {
+            flags,
+            _pad: [0; 3],
+            uv_rect: Vec4::new(
+                uv.0 as f32 / iw as f32,
+                uv.1 as f32 / ih as f32,
+                uv.2 as f32 / iw as f32,
+                uv.3 as f32 / ih as f32,
+            ),
+        }
+    };
+    let h = fx_materials.add(SkinFxMaterial {
+        uniform,
+        texture: handle.clone(),
+    });
+    fx_cache.insert(key, h.clone());
+    h
 }
 
 /// 文本对象帧求值（与图片 `evaluate_frame` 的 timer/frame_at 规则一致）：
@@ -554,24 +643,6 @@ pub fn hide_skin_slots(
 mod tests {
     use super::*;
 
-    #[test]
-    fn luma_key_alpha_work() {
-        // 纯黑 → 全透明（黑底抠掉）
-        assert_eq!(luma_key_alpha(0, 0, 0, 255), 0);
-        // 抗锯齿灰边按亮度淡出（不再残留灰/黑边）
-        assert_eq!(luma_key_alpha(30, 30, 30, 255), 30);
-        assert_eq!(luma_key_alpha(64, 64, 64, 255), 64);
-        // 纯白 → 全不透明（特效本体）
-        assert_eq!(luma_key_alpha(255, 255, 255, 255), 255);
-        // 带 alpha 通道的图：取亮度与原有 alpha 的较小值
-        assert_eq!(luma_key_alpha(128, 128, 128, 128), 128);
-        // 带 alpha 通道的透明背景（RGB=0）保持透明
-        assert_eq!(luma_key_alpha(0, 0, 0, 0), 0);
-        // 幂等：重复处理（皮肤重载场景）结果不变
-        let once = luma_key_alpha(96, 96, 96, 255);
-        assert_eq!(once, 96);
-        assert_eq!(luma_key_alpha(96, 96, 96, once), once, "重复处理不得二次衰减");
-    }
 
     /// 构造一段两帧的淡出文本动画（模拟 Play5 loading-title 的游玩中组：
     /// timer=40、loop=-1、a 255→0）。

@@ -91,8 +91,8 @@ impl BgaPlayer {
                 depth_or_array_layers: 1,
             },
             TextureDimension::D2,
-            vec![0u8; 16], // 2×2 RGBA 占位（黑）
-            TextureFormat::Rgba8UnormSrgb,
+            vec![0u8; 16], // 2×2 BGRA 占位（黑；GPU shader 重排为 RGBA）
+            TextureFormat::Bgra8UnormSrgb,
             RenderAssetUsages::MAIN_WORLD | RenderAssetUsages::RENDER_WORLD,
         ));
 
@@ -148,7 +148,7 @@ impl BgaPlayer {
                         height: f.h,
                         depth_or_array_layers: 1,
                     };
-                    img.texture_descriptor.format = TextureFormat::Rgba8UnormSrgb;
+                    img.texture_descriptor.format = TextureFormat::Bgra8UnormSrgb;
                     self.video_size = Some((f.w, f.h));
                 }
             }
@@ -395,7 +395,7 @@ impl BgaVideo {
             format,
             width,
             height,
-            ffmpeg::format::Pixel::RGBA,
+            ffmpeg::format::Pixel::BGRA,
             width,
             height,
             ffmpeg::software::scaling::Flags::BILINEAR,
