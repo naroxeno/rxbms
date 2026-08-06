@@ -72,7 +72,7 @@ struct DecodePool {
     _handles: Vec<thread::JoinHandle<()>>,
 }
 
-/// 后台解码线程数。
+/// 后台解码线程数。 TODO: to make this configurable
 const DECODE_THREADS: usize = 4;
 
 impl DecodePool {
@@ -133,17 +133,15 @@ pub struct AudioManager {
     /// kira 音频管理器（cpal 输出，音频线程渲染）。
     kira: kira::AudioManager<DefaultBackend>,
     /// 主界面（master）音轨：选曲/标题界面的 BGM，独立于 gameplay 生命周期。
-    menu_track: TrackHandle,
-    /// 节拍器专用轨道（常驻合成音，独立于键音轨，避免污染 `is_playing`
-    /// 对键音轨 `num_sounds` 的判定）。
-    #[allow(dead_code)] // 持有句柄以保持轨道存活（节拍器常驻其上）
-    metronome_track: TrackHandle,
+    tracks: Tracks,
     /// 谱面时钟（BPM × 192 tick）。BGM 播放以 `clock.time()` 对齐。
     clock: ClockHandle,
     /// 节拍器（第 6 章自定义 Sound，常驻 se 轨道，tempo/开关可编程控制）。
     metronome: MetronomeHandle,
     /// 当前主界面 BGM 流（`stop_menu_bgm` 时取走停止）。
     menu_handle: Option<StreamingSoundHandle<FromFileError>>,
+    /// 当前铺面正在播放的 BGM 流（`stop_all` 时取走停止）。
+    bgm_handle: Option<StreamingSoundHandle<FromFileError>>,
     /// 标记为 BGM 且**大文件**（走流式播放，不缓存）的路径。
     streaming_paths: HashSet<PathBuf>,
     /// 缓存与引用计数（与设备解耦）。
@@ -156,38 +154,62 @@ pub struct AudioManager {
     pending_low: Vec<PathBuf>,
     /// 全局音量（0.0–1.0，线性 → main track 的 dB 音量）。
     volume: f32,
-    /// 当前铺面的播放资源（轨道 + BGM 流）。`stop_all` 时 take + drop →
-    /// 轨道销毁，其上**所有声音**（含静态 BGM/键音）真正停止，不残留到下一场。
-    song: Option<SongAudio>,
 }
 
-/// 单场铺面的音频资源：BGM 轨 + 键音轨 + 当前 BGM 流。
+/// 全部 kira 音轨的统一管理（main → {menu, metronome, bgm, keysound} 分层）。
 ///
-/// drop 时两个 `TrackHandle` 触发 kira 轨道移除，轨道上的全部声音随之销毁
-/// （`TrackHandle` 的 `Drop` → `mark_for_removal`）。
-struct SongAudio {
-    /// BGM 流式播放轨道（大文件流式解码）。
-    bgm_track: TrackHandle,
-    /// 键音播放轨道（静态采样，多路并发：键音 + 小 BGM 事件）。
-    keysound_track: TrackHandle,
-    /// 当前正在播放的 BGM 流。
-    bgm_handle: Option<StreamingSoundHandle<FromFileError>>,
+/// - **常驻轨**（menu/metronome）：与 [`AudioManager`] 同生命周期；
+/// - **每场铺面轨**（bgm/keysound）：`begin_song` 时创建，`stop_all` 时 take + drop
+///   销毁（`TrackHandle` 的 `Drop` → `mark_for_removal`，轨道上的**所有声音**
+///   随之停止，不残留到下一场）。
+struct Tracks {
+    /// 主界面（选曲/标题）BGM 轨，独立于 gameplay 生命周期。
+    menu: TrackHandle,
+    /// 节拍器专用轨道（常驻合成音，独立于键音轨，避免污染 `is_playing`
+    /// 对键音轨 `num_sounds` 的判定）。
+    metronome: TrackHandle,
+    /// 本场铺面 BGM 轨（流式播放）。
+    bgm: Option<TrackHandle>,
+    /// 本场铺面键音轨（静态采样，多路并发：键音 + 小 BGM 事件）。
+    keysound: Option<TrackHandle>,
 }
 
-impl SongAudio {
-    /// 创建本场铺面的播放轨道。
+impl Tracks {
+    /// 创建常驻轨道（menu + metronome）。
     fn new(kira: &mut kira::AudioManager<DefaultBackend>) -> Result<Self, String> {
-        let bgm_track = kira
+        let menu = kira
             .add_sub_track(TrackBuilder::default())
-            .map_err(|e| format!("创建 BGM 轨道失败: {e}"))?;
-        let keysound_track = kira
+            .map_err(|_| "创建主界面音轨失败".to_string())?;
+        let metronome = kira
             .add_sub_track(TrackBuilder::default())
-            .map_err(|e| format!("创建键音轨道失败: {e}"))?;
+            .map_err(|_| "创建节拍器轨道失败".to_string())?;
         Ok(Self {
-            bgm_track,
-            keysound_track,
-            bgm_handle: None,
+            menu,
+            metronome,
+            bgm: None,
+            keysound: None,
         })
+    }
+
+    /// 确保本场铺面的播放轨道已创建（上一场 `destroy_song_tracks` 销毁后重建）。
+    fn ensure_song_tracks(&mut self, kira: &mut kira::AudioManager<DefaultBackend>) {
+        if self.bgm.is_some() {
+            return;
+        }
+        match kira.add_sub_track(TrackBuilder::default()) {
+            Ok(bgm) => self.bgm = Some(bgm),
+            Err(e) => warn!("[audio] 创建 BGM 轨道失败: {e}"),
+        }
+        match kira.add_sub_track(TrackBuilder::default()) {
+            Ok(keysound) => self.keysound = Some(keysound),
+            Err(e) => warn!("[audio] 创建键音轨道失败: {e}"),
+        }
+    }
+
+    /// 销毁本场铺面的播放轨道（轨道上的全部声音随之停止）。
+    fn destroy_song_tracks(&mut self) {
+        self.bgm = None;
+        self.keysound = None;
     }
 }
 
@@ -200,36 +222,31 @@ impl AudioManager {
     pub fn new() -> Result<Self, String> {
         let mut kira = kira::AudioManager::<DefaultBackend>::new(AudioManagerSettings::default())
             .map_err(|e| format!("初始化音频后端失败: {e}"))?;
-        let menu_track = kira
-            .add_sub_track(TrackBuilder::default())
-            .map_err(|_| "创建主界面音轨失败".to_string())?;
-        let mut metronome_track = kira
-            .add_sub_track(TrackBuilder::default())
-            .map_err(|_| "创建节拍器轨道失败".to_string())?;
+        let mut tracks = Tracks::new(&mut kira)?;
         // 谱面时钟：初始 120 BPM × 192 分辨率，`begin_song` 时按谱面实际 BPM 调整
         let clock = kira
             .add_clock(ClockSpeed::TicksPerMinute(120.0 * 192.0))
             .map_err(|_| "创建谱面时钟失败".to_string())?;
         // 节拍器常驻独立轨道（默认静音，`set_metronome` 开启）
-        let metronome = metronome_track
+        let metronome = tracks
+            .metronome
             .play(MetronomeData::default())
             .map_err(|_| "启动节拍器失败".to_string())?;
         let (ready_tx, ready_rx) = mpsc::channel();
         let pool = DecodePool::new(ready_tx);
         Ok(Self {
             kira,
-            menu_track,
-            metronome_track,
+            tracks,
             clock,
             metronome,
             menu_handle: None,
+            bgm_handle: None,
             streaming_paths: HashSet::new(),
             cache: AudioCache::default(),
             pool,
             ready_rx: Mutex::new(ready_rx),
             pending_low: Vec::new(),
             volume: 1.0,
-            song: None,
         })
     }
 
@@ -337,13 +354,7 @@ impl AudioManager {
 
     /// 确保本场谱面的播放轨道已创建（上一场 `stop_all` 销毁后重建）。
     fn ensure_song_tracks(&mut self) {
-        if self.song.is_some() {
-            return;
-        }
-        match SongAudio::new(&mut self.kira) {
-            Ok(song) => self.song = Some(song),
-            Err(e) => warn!("[audio] 创建谱面播放轨道失败: {e}"),
-        }
+        self.tracks.ensure_song_tracks(&mut self.kira);
     }
 
     /// 谱面退出：释放租约（引用计数 -1），引用归零的按 LRU 淘汰；清空 BGM 标记。
@@ -377,10 +388,10 @@ impl AudioManager {
                 }
             },
         };
-        let Some(song) = self.song.as_mut() else {
+        let Some(keysound) = self.tracks.keysound.as_mut() else {
             return false;
         };
-        song.keysound_track.play(data).is_ok()
+        keysound.play(data).is_ok()
     }
 
     /// 播放 BGM：流式解码 + 谱面时钟对齐（音频线程精确开始）。
@@ -388,18 +399,18 @@ impl AudioManager {
     /// BMS 的 BGM 事件触发语义 = 切换/重播当前 BGM：先停止旧流，避免
     /// 退出后旧 BGM 残留（kira 的流式 handle 无 Drop 停止语义，必须显式 `stop`）。
     fn play_bgm(&mut self, path: &Path) -> bool {
-        let Some(song) = self.song.as_mut() else {
+        let Some(bgm_track) = self.tracks.bgm.as_mut() else {
             return false;
         };
-        if let Some(mut old) = song.bgm_handle.take() {
+        if let Some(mut old) = self.bgm_handle.take() {
             old.stop(Tween::default());
         }
         match StreamingSoundData::from_file(path)
             .map(|d| d.start_time(self.clock.time()))
         {
-            Ok(data) => match song.bgm_track.play(data) {
+            Ok(data) => match bgm_track.play(data) {
                 Ok(handle) => {
-                    song.bgm_handle = Some(handle);
+                    self.bgm_handle = Some(handle);
                     true
                 }
                 Err(e) => {
@@ -423,7 +434,7 @@ impl AudioManager {
     pub fn play_menu_bgm(&mut self, path: &Path) -> bool {
         self.stop_menu_bgm();
         match StreamingSoundData::from_file(path) {
-            Ok(data) => match self.menu_track.play(data) {
+            Ok(data) => match self.tracks.menu.play(data) {
                 Ok(handle) => {
                     self.menu_handle = Some(handle);
                     true
@@ -463,10 +474,13 @@ impl AudioManager {
     /// 注意：不用 `pause`——pause 只暂停不销毁，下一场 `resume` 会让旧声音
     /// 复活重叠（2026-08 修复的 bug）。不影响主界面音轨（`menu_track`）。
     pub fn stop_all(&mut self) {
-        // drop SongAudio：两个 TrackHandle 触发 kira 轨道移除（`mark_for_removal`），
+        // 销毁本场铺面轨道：`TrackHandle` drop 触发 kira 轨道移除（`mark_for_removal`），
         // 轨道默认 `persist_until_sounds_finish=false`，下一音频回调周期即整体销毁，
         // 其上所有声音（大 BGM 流 + 静态 BGM + 键音）随之停止，无"播完才停"残留。
-        self.song = None;
+        self.tracks.destroy_song_tracks();
+        if let Some(mut handle) = self.bgm_handle.take() {
+            handle.stop(Tween::default());
+        }
         self.clock.pause();
     }
 
@@ -476,12 +490,14 @@ impl AudioManager {
     /// `num_sounds` 不受常驻节拍器影响——节拍器在独立轨道）。
     #[must_use]
     pub fn is_playing(&self) -> bool {
-        self.song.as_ref().is_some_and(|s| {
-            s.bgm_handle
+        self.bgm_handle
+            .as_ref()
+            .is_some_and(|h| h.state() == PlaybackState::Playing)
+            || self
+                .tracks
+                .keysound
                 .as_ref()
-                .is_some_and(|h| h.state() == PlaybackState::Playing)
-                || s.keysound_track.num_sounds() > 0
-        })
+                .is_some_and(|t| t.num_sounds() > 0)
     }
 
     /// 设置全局音量（0.0–1.0，线性值 → main track 的 dB，`Tween` 平滑过渡）。
@@ -822,7 +838,3 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
-
-
-
-
