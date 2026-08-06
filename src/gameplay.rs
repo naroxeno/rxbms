@@ -94,6 +94,9 @@ pub struct GameplaySession {
     exiting: bool,
     /// 请求退出的时刻（超时兜底强制切）。
     exit_requested_at: TimeStamp,
+    /// 已触发的事件 id（bms-rs 对 LN 用区间重叠语义，每帧重复返回同一事件；
+    /// 去重后键音/判定只在首次出现时触发）。
+    triggered_events: std::collections::HashSet<usize>,
     /// Auto 模式（F2 切换）：音符自动 PG，忽略输入。
     auto: bool,
     /// 当前游玩模式（由谱面键位决定，选择对应键位绑定）。
@@ -200,6 +203,7 @@ pub(crate) fn setup_gameplay(
         loading: true,
         exiting: false,
         exit_requested_at: started_at,
+        triggered_events: std::collections::HashSet::new(),
         auto: false,
         mode,
     });
@@ -288,10 +292,16 @@ fn tick_gameplay(
         }
     }
 
-    // 推进播放头，收集触发事件（音频经解码缓存 + mixer 并发 push，主线程零阻塞）
+    // 推进播放头，收集触发事件。
+    // **注意**：bms-rs 的 `events_in_y_range` 对 LN 用"区间重叠"语义（渲染需要 LN body
+    // 持续可见）——长音期间每帧都返回同一 LN 事件。这里按事件 id **去重**：
+    // 只有事件**首次**出现时触发（键音/判定），后续帧同 id 直接跳过。
     let now = TimeStamp::now();
     let events = session.player.with_dependent_mut(|_, p| p.update(now));
     for e in &events {
+        if !session.triggered_events.insert(e.id.0) {
+            continue; // 已处理过（LN 持续事件 / 已触发事件）
+        }
         match &e.event {
             ChartEvent::Note {
                 side: PlayerSide::Player1,
