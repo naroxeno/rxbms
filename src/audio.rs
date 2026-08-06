@@ -114,7 +114,8 @@ impl AudioManager {
             .metronome
             .play(MetronomeData::default())
             .map_err(|_| "启动节拍器失败".to_string())?;
-        let (ready_tx, ready_rx) = mpsc::channel();
+        // 有界结果通道：worker 解码完成后阻塞回传（背压防内存堆积）
+        let (ready_tx, ready_rx) = mpsc::sync_channel(64);
         let pool = DecodePool::new(ready_tx);
         Ok(Self {
             kira,
