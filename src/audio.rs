@@ -36,7 +36,7 @@ use kira::{
     clock::ClockSpeed,
     sound::{
         FromFileError, PlaybackState,
-        static_sound::StaticSoundData,
+        static_sound::{StaticSoundData, StaticSoundHandle},
         streaming::{StreamingSoundData, StreamingSoundHandle},
     },
 };
@@ -65,6 +65,33 @@ const STREAMING_MIN_BYTES: u64 = 2_000_000;
 /// 也走静态缓存——否则每次事件停旧流重开，背景音被掐断。
 const STREAMING_MAX_EVENTS: usize = 8;
 
+/// 当前铺面 BGM 的播放句柄（流式大 BGM 或静态缓存 BGM 统一封装，
+/// 供去重判断与停止使用）。
+enum BgmHandle {
+    /// 流式大 BGM（`StreamingSoundData`，省内存）。
+    Streaming(StreamingSoundHandle<FromFileError>),
+    /// 静态缓存 BGM（`StaticSoundData`，密集事件引用的大文件走缓存）。
+    Static(StaticSoundHandle),
+}
+
+impl BgmHandle {
+    /// 是否仍在播放（用于 BGM 事件去重与 `is_playing` 判定）。
+    fn is_playing(&self) -> bool {
+        match self {
+            Self::Streaming(h) => h.state() == PlaybackState::Playing,
+            Self::Static(h) => h.state() == PlaybackState::Playing,
+        }
+    }
+
+    /// 停止播放。
+    fn stop(&mut self) {
+        match self {
+            Self::Streaming(h) => h.stop(Tween::default()),
+            Self::Static(h) => h.stop(Tween::default()),
+        }
+    }
+}
+
 /// 全局音频管理器（Resource）。
 #[derive(Resource)]
 pub struct AudioManager {
@@ -78,8 +105,10 @@ pub struct AudioManager {
     metronome: MetronomeHandle,
     /// 当前主界面 BGM 流（`stop_menu_bgm` 时取走停止）。
     menu_handle: Option<StreamingSoundHandle<FromFileError>>,
-    /// 当前铺面正在播放的 BGM 流（`stop_all` 时取走停止）。
-    bgm_handle: Option<StreamingSoundHandle<FromFileError>>,
+    /// 当前铺面正在播放的 BGM（`stop_all` 时取走停止；去重/状态查询用）。
+    bgm_handle: Option<BgmHandle>,
+    /// 当前铺面 BGM 的路径（去重：相同 BGM 正在播放时忽略后续事件）。
+    bgm_path: Option<PathBuf>,
     /// 标记为 BGM 且**大文件**（走流式播放，不缓存）的路径。
     streaming_paths: HashSet<PathBuf>,
     /// 缓存与引用计数（与设备解耦）。
@@ -124,6 +153,7 @@ impl AudioManager {
             metronome,
             menu_handle: None,
             bgm_handle: None,
+            bgm_path: None,
             streaming_paths: HashSet::new(),
             cache: AudioCache::default(),
             pool,
@@ -277,6 +307,55 @@ impl AudioManager {
         keysound.play(data).is_ok()
     }
 
+    /// 播放一次 BGM 事件（`ChartEvent::Bgm` 触发）。
+    ///
+    /// **去重**：BMS 谱面常在 01 通道密集放置 BGM 事件（rainbow 每秒 ~20 个、
+    /// 部分谱面每 16 分音符一个）。若每个事件都重新播放，整曲 BGM 会被反复
+    /// 从头重播、永远跟不上铺面（beatoraja 语义：相同 BGM 正在播放时忽略
+    /// 后续事件）。同一路径且仍在 Playing → 直接忽略。
+    pub fn play_bgm_event(&mut self, path: &Path) -> bool {
+        if self.bgm_path.as_deref() == Some(path)
+            && self
+                .bgm_handle
+                .as_ref()
+                .is_some_and(BgmHandle::is_playing)
+        {
+            return true; // 相同 BGM 仍在播放 → 忽略（不重播）
+        }
+        self.bgm_path = Some(path.to_path_buf());
+        self.ensure_song_tracks();
+        if !self.should_cache(path) {
+            return self.play_bgm(path); // 流式（内部设置 bgm_handle）
+        }
+        // 静态缓存：priority 预解码命中直接播；未命中同步解码一次并缓存
+        let data = match self.cache.get(path) {
+            Some(data) => data.clone(),
+            None => match StaticSoundData::from_file(path) {
+                Ok(data) => {
+                    self.cache.insert_ready(path.to_path_buf(), data.clone());
+                    data
+                }
+                Err(e) => {
+                    warn!("[audio] BGM 同步解码失败 {}: {e}", path.display());
+                    return false;
+                }
+            },
+        };
+        let Some(keysound) = self.tracks.keysound.as_mut() else {
+            return false;
+        };
+        match keysound.play(data) {
+            Ok(handle) => {
+                self.bgm_handle = Some(BgmHandle::Static(handle));
+                true
+            }
+            Err(e) => {
+                warn!("[audio] BGM 静态播放失败 {}: {e}", path.display());
+                false
+            }
+        }
+    }
+
     /// 播放 BGM：流式解码 + 谱面时钟对齐（音频线程精确开始）。
     ///
     /// BMS 的 BGM 事件触发语义 = 切换/重播当前 BGM：先停止旧流，避免
@@ -286,14 +365,13 @@ impl AudioManager {
             return false;
         };
         if let Some(mut old) = self.bgm_handle.take() {
-            old.stop(Tween::default());
+            old.stop();
         }
-        match StreamingSoundData::from_file(path)
-            .map(|d| d.start_time(self.clock.time()))
-        {
+        let clock_now = self.clock.time();
+        match StreamingSoundData::from_file(path).map(|d| d.start_time(clock_now)) {
             Ok(data) => match bgm_track.play(data) {
                 Ok(handle) => {
-                    self.bgm_handle = Some(handle);
+                    self.bgm_handle = Some(BgmHandle::Streaming(handle));
                     true
                 }
                 Err(e) => {
@@ -362,8 +440,9 @@ impl AudioManager {
         // 其上所有声音（大 BGM 流 + 静态 BGM + 键音）随之停止，无"播完才停"残留。
         self.tracks.destroy_song_tracks();
         if let Some(mut handle) = self.bgm_handle.take() {
-            handle.stop(Tween::default());
+            handle.stop();
         }
+        self.bgm_path = None;
         self.clock.pause();
     }
 
@@ -375,7 +454,7 @@ impl AudioManager {
     pub fn is_playing(&self) -> bool {
         self.bgm_handle
             .as_ref()
-            .is_some_and(|h| h.state() == PlaybackState::Playing)
+            .is_some_and(BgmHandle::is_playing)
             || self
                 .tracks
                 .keysound

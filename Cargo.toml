@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 bevy = { version = "0.19.0", features = ["serialize"] }
-bms-rs = { git = "https://github.com/naroxeno/bms-rs.git", version = "1.0.0" }
+bms-rs = { git = "https://github.com/naroxeno/bms-rs.git", version = "1.0.0" , branch = "fix-chart-off-by-one-error"}
 # BMS 文件常用 Shift_JIS 编码，bms-rs 只接受 UTF-8，需要转码
 encoding_rs = "0.8"
 # 配置持久化（~/.rxbms/config.json，键位绑定等）

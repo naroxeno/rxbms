@@ -1925,7 +1925,7 @@ dependencies = [
 [[package]]
 name = "bms-rs"
 version = "1.0.0"
-source = "git+https://github.com/naroxeno/bms-rs.git#1eb789caa32a3e0851d274723468576de26a2d08"
+source = "git+https://github.com/naroxeno/bms-rs.git?branch=fix-chart-off-by-one-error#5babe831521f188c8d9ef565c141b29bd9052b53"
 dependencies = [
  "ariadne",
  "gametime",

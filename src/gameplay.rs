@@ -348,7 +348,7 @@ fn tick_gameplay(
                 if let Some(id) = wav_id
                     && let Some(path) = session.loaded.wav_paths.get(id)
                 {
-                    audio.play_synced(path);
+                    audio.play_bgm_event(path);
                 }
             }
             _ => {}
