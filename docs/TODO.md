@@ -1,7 +1,25 @@
 # rxbms TODO
 
 Bevy 0.19 BMS 铺面播放器 — 未完成事项清单。
-基线：74 测试全绿（2026-08），kira 音频 + beatoraja 皮肤移植完成。
+基线：77 测试全绿（2026-10），kira 音频 + beatoraja 皮肤移植完成。
+
+## 最近完成（2026-08-14 ~ 2026-10-17）
+
+- **ffmpeg 依赖**：`ffmpeg-next` 8.1.0 → 9.0.0，适配系统 ffmpeg 9.0.2 / libavcodec 63
+  （此前 14 个编译错误全在 crate 内部，整仓库无法 `cargo test`）
+- **铺面加载内存**（用户报告"加载铺面时内存过大"）：
+  1. 音频不再整谱一次性解码 → `pump_preload` 按谱面时间 ±10s 滚动窗口预加载；
+  2. LRU 淘汰对"已租约"项生效（旧实现只在 `refs == 0` 里找候选 → 上限从未生效），
+     首批音频 pinned 不可淘汰，miss 时同步解码补回；
+  3. BGA 帧缓冲 16 → 4 且复用 `img.data`，解码通道改有界 `sync_channel(4)`；
+  4. 事件读取改 `events().as_events()` 切片，去掉整份事件 Vec 的深拷贝
+- **BGM 丢音**：BGM 拆三条子轨（`bgm` / `bgm_sample` / `keysound`），一次性采样走
+  `bgm_sample` 并有 256 声部软上限；BGM 角色改**相对判定**（时长 ≥ 铺面时长 × 25%
+  才算连续音频 Bed），修掉"1.0s 绝对阈值把 1.32s 鼓组采样判成 BGM 而丢 42% 事件"
+- **谱面资源统一释放**：`src/gameplay/resources.rs` 的 `cleanup_gameplay_resources`
+  成为 `OnExit(Gameplay)` 唯一释放入口（音频租约/皮肤槽位/资源统计）
+- **谱面结束判定**：改用每个音符实体的 `consumed`（LN 会 record 两次，
+  `judged() >= note_count` 会让长音谱面提前结束）
 
 ## 优先级 P0（游玩体验关键）
 
@@ -14,10 +32,10 @@ Bevy 0.19 BMS 铺面播放器 — 未完成事项清单。
     `self_cell`（`ChartPlayback`）绑定 (Arc<Chart>, ChartPlayer)，随
     GameplaySession 整体释放，无泄漏（`src/gameplay.rs`）
 
-- [ ] **y=0 事件被 bms-rs 排除**
-  - 现状：`ChartPlayer.update` 用 `(Excluded(prev_y), Included(cur_y))`，start 时 `progressed_y=0`
-    → 谱面第 0 小节首行的事件（首个 BGM/键音）不触发
-  - 目标：谱面开头第一个事件能触发（或确认 bms-rs 语义后适配）
+- [x] **y=0 事件被 bms-rs 排除**
+  - ✅ 已在 bms-rs fork 分支 `fix-stop-duration-ms` 修复（cee4348：首帧用闭区间）
+  - ⚠️ 仓内无回归覆盖：fork 里对应测试被删（137805f）。建议在 rxbms 侧补一个
+    "谱面第 0 小节首行事件能触发"的集成测试
 
 ## 优先级 P1（功能补全）
 
@@ -62,6 +80,9 @@ Bevy 0.19 BMS 铺面播放器 — 未完成事项清单。
 - [ ] **混音器/音频延迟可配置**
   - kira 内部缓冲（128 采样）→ 设置项暴露（延迟 vs 稳定性权衡）
 
+- [ ] **音频类设置项**：BGM 角色判定比例 `BED_MIN_CHART_RATIO`（当前常量 0.25）
+  与"多长算连续音频"开关（Auto / 全部叠音 / 全部去重）暴露到设置，供异常谱面自救
+
 - [ ] **BGA Overlay / Poor 层**
   - beatoraja 的 overlay 层（事件层叠加）、miss-layer（漏键时画面层）未实现
 
@@ -69,6 +90,10 @@ Bevy 0.19 BMS 铺面播放器 — 未完成事项清单。
   - 现状：`songs.db` 已支持扫描/统计/去重；选曲排序、搜索、难度过滤、模式过滤未做
 
 ## 已知边界（暂不实现，记录备查）
+
+- **`-fuse-ld=wild` 实际未生效**：写在 `Cargo.toml` 的
+  `[target.'cfg(target_os = "linux")'] rustflags` 不是有效 Cargo 键（构建警告
+  `unused manifest key`），需挪到 `.cargo/config.toml` 才生效；`resolver` 键同理
 
 - **DP（14K）**：双玩家模式不支持（当前 7k/5k 单玩家）
 - **pop（9K）**：9 键玩法解析不做

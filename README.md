@@ -48,7 +48,7 @@ cargo run --release
 ## 测试
 
 ```bash
-cargo test          # 74 测试（判定/音频缓存/皮肤求值/BMS 解析等）
+cargo test          # 77 测试（判定/音频缓存/皮肤求值/BMS 解析等）
 cargo clippy        # 保持零警告（除既有 manifest key ×2）
 ```
 
@@ -87,7 +87,7 @@ src/
 ## 技术栈
 
 - Bevy 0.19（ECU/渲染/UI）
-- bms-rs（BMS 解析，git fork：`https://github.com/naroxeno/bms-rs.git`）
+- bms-rs（BMS 解析，git fork：`https://github.com/naroxeno/bms-rs.git`，分支 `fix-stop-duration-ms`）
 - kira 0.12 + cpal（音频输出）+ Symphonia（解码）
 - ffmpeg-next（BGA 视频）
 - mlua（LuaJIT，皮肤脚本）
