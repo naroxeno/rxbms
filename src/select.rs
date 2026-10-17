@@ -12,6 +12,7 @@ use crate::{
     core::{state::AppState, UiFont},
     database::SongsDb,
     gameplay::chart::SelectedChart,
+    library::{LibraryChanged, LibraryStatus, SongScanner},
 };
 
 /// 选曲界面插件。
@@ -20,7 +21,11 @@ pub struct SongSelectPlugin;
 impl Plugin for SongSelectPlugin {
     fn build(&self, app: &mut App) {
         app.add_systems(OnEnter(AppState::SongSelect), enter_song_select)
-            .add_systems(Update, song_row_click.run_if(in_state(AppState::SongSelect)))
+            .add_systems(
+                Update,
+                (song_row_click, song_select_keys, rebuild_after_scan)
+                    .run_if(in_state(AppState::SongSelect)),
+            )
             .add_systems(OnExit(AppState::SongSelect), exit_song_select);
     }
 }
@@ -36,9 +41,28 @@ struct SongRow {
     title: String,
 }
 
-fn enter_song_select(mut commands: Commands, db: Res<SongsDb>, ui_font: Res<UiFont>) {
+fn enter_song_select(
+    mut commands: Commands,
+    db: Res<SongsDb>,
+    ui_font: Res<UiFont>,
+    status: Res<LibraryStatus>,
+) {
     let songs = db.list_songs().unwrap_or_default();
-    info!("[song-select] 进入选曲界面（{} 个铺面，点击进入游玩）", songs.len());
+    info!(
+        "[song-select] 进入选曲界面（{} 个铺面{}，点击进入游玩）",
+        songs.len(),
+        if status.scanning {
+            format!("，后台扫描中 {}/{}", status.done, status.total)
+        } else {
+            String::new()
+        }
+    );
+    spawn_song_list(&mut commands, &db, &ui_font);
+}
+
+/// 按数据库当前内容重建列表（数据库查询失败时静默保持空列表）。
+fn spawn_song_list(commands: &mut Commands, db: &SongsDb, ui_font: &UiFont) {
+    let songs = db.list_songs().unwrap_or_default();
     commands
         .spawn((
             SongListUi,
@@ -105,6 +129,38 @@ fn song_row_click(
             });
             NextState::set_if_neq(&mut next, AppState::Gameplay);
         }
+    }
+}
+
+/// 后台扫描完成后重建铺面列表（保留当前选中项由后续选曲界面实现接管）。
+fn rebuild_after_scan(
+    mut commands: Commands,
+    mut changed: MessageReader<LibraryChanged>,
+    db: Res<SongsDb>,
+    ui_font: Res<UiFont>,
+    roots: Query<Entity, With<SongListUi>>,
+) {
+    let mut latest = None;
+    for event in changed.read() {
+        latest = Some(event.report);
+    }
+    let Some(report) = latest else {
+        return;
+    };
+    info!("[song-select] 扫描完成，刷新列表: {report}");
+    for root in &roots {
+        commands.entity(root).despawn();
+    }
+    spawn_song_list(&mut commands, &db, &ui_font);
+}
+
+/// 选曲界面按键：F5 手动重扫（后台执行，唯一的列表刷新入口之一）。
+fn song_select_keys(keys: Res<ButtonInput<KeyCode>>, scanner: Option<Res<SongScanner>>) {
+    if keys.just_pressed(KeyCode::F5)
+        && let Some(scanner) = scanner
+    {
+        info!("[song-select] 手动重扫铺面库");
+        scanner.request_scan_all();
     }
 }
 

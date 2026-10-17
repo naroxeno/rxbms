@@ -98,7 +98,7 @@ impl LoadedChart {
     /// 文件读取、解析或 Chart 处理失败时返回错误。
     pub fn load(path: &Path) -> Result<Self, String> {
         let bytes = fs::read(path).map_err(|e| format!("读取失败: {e}"))?;
-        let source = decode_bms(&bytes);
+        let source = decode_bms(&bytes)?;
         let output = parse_bms(&source, default_config());
         let bms = output.bms.map_err(|e| format!("解析失败: {e}"))?;
         let chart = Process::<KeyLayoutBeat>::process(&bms)

@@ -1,9 +1,22 @@
 # rxbms TODO
 
 Bevy 0.19 BMS 铺面播放器 — 未完成事项清单。
-基线：77 测试全绿（2026-10），kira 音频 + beatoraja 皮肤移植完成。
+基线：88 测试全绿（+2 个 `#[ignore]` 手动基准，2026-10）。
 
 ## 最近完成（2026-08-14 ~ 2026-10-17）
+
+- **铺面导入（重写 `src/database.rs` + 新增 `src/library.rs`）**：
+  - 扫描改后台线程（`SongScanner`，`Update` 中只排空事件），启动不再阻塞界面
+  - `ignore::WalkBuilder::build_parallel()` 并行枚举 + `MAX_PARSE_THREADS = 12`
+    并行解析（`std::thread::scope` + 原子派发），单文件 `catch_unwind` 隔离 panic
+  - 增量判据 `(size, mtime_ns, parse_version)`；`PARSE_VERSION` 提升即全库重解析
+  - 扫描触发：**只按需扫描**（设置页「重新扫描」/ 添加目录 / 选曲页 F5），无后台周期扫描；曾尝试 notify 热重载，因会自我触发反复扫描已移除
+  - 健壮性：二进制/非法编码拒收（Shift_JIS 替换字符比例）、`scan_errors` 表记录
+    失败原因、内容哈希去重（同内容只展示一条）、改名/搬移「复活」原记录保留身份、
+    删除标 inactive（可恢复）、嵌套根目录去重
+  - SQLite 换 WAL + `synchronous=NORMAL` + `busy_timeout`，批量 upsert（512/批）
+  - 实测：500 个合成铺面首扫 42ms / 增量 12ms；真实库（68 铺面 15MB BMS 文本）
+    首扫 1.47s（bms-rs 解析为主）、增量 10ms
 
 - **ffmpeg 依赖**：`ffmpeg-next` 8.1.0 → 9.0.0，适配系统 ffmpeg 9.0.2 / libavcodec 63
   （此前 14 个编译错误全在 crate 内部，整仓库无法 `cargo test`）
@@ -86,8 +99,10 @@ Bevy 0.19 BMS 铺面播放器 — 未完成事项清单。
 - [ ] **BGA Overlay / Poor 层**
   - beatoraja 的 overlay 层（事件层叠加）、miss-layer（漏键时画面层）未实现
 
-- [ ] **铺面数据库完善**（`src/database.rs`）
-  - 现状：`songs.db` 已支持扫描/统计/去重；选曲排序、搜索、难度过滤、模式过滤未做
+- [ ] **选曲界面重做**（`src/select.rs`，仍是 121 行原型）
+  - 现状：铺面库已就绪（按需扫描/去重/热重载已移除），界面只有一列纯文本按钮
+  - 待做：可滚动列表、选择框、音频预览（`play_menu_bgm` 已有但无调用方）、
+    排序（难度/BPM/标题）、搜索、难度与模式过滤、历史最佳（依赖下方游玩记录）
 
 ## 已知边界（暂不实现，记录备查）
 

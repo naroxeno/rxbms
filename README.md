@@ -48,7 +48,7 @@ cargo run --release
 ## 测试
 
 ```bash
-cargo test          # 77 测试（判定/音频缓存/皮肤求值/BMS 解析等）
+cargo test          # 88 测试（判定/音频缓存/皮肤求值/BMS 解析/扫描增量等）
 cargo clippy        # 保持零警告（除既有 manifest key ×2）
 ```
 

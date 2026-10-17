@@ -4,6 +4,7 @@ mod audio;
 mod core;
 mod database;
 mod gameplay;
+mod library;
 mod rank;
 mod record;
 mod result;
@@ -22,6 +23,7 @@ use crate::{
     audio::AudioManagerPlugin,
     core::CorePlugin,
     database::SongDatabasePlugin,
+    library::SongLibraryPlugin,
     gameplay::GameplayPlugin,
     record::RecordPlugin,
     result::ResultPlugin,
@@ -71,6 +73,7 @@ fn main() {
         .add_plugins(SkinPlugin)
         .add_plugins(AudioManagerPlugin)
         .add_plugins(SongDatabasePlugin)
+        .add_plugins(SongLibraryPlugin)
         .add_plugins(SongSelectPlugin)
         .add_plugins(GameplayPlugin)
         .add_plugins(ResultPlugin)

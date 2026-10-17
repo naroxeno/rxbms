@@ -19,6 +19,7 @@ use crate::{
     core::state::AppState,
     core::UiFont,
     database::SongsDb,
+    library::{LibraryChanged, LibraryProgress, LibraryStatus, SongScanner},
 };
 
 /// 设置界面插件。
@@ -34,6 +35,11 @@ impl Plugin for SettingsPlugin {
                 (settings_actions, refresh_settings_ui)
                     .chain()
                     .run_if(in_state(AppState::Settings)),
+            )
+            // 后台扫描的进度/完成状态转成界面文字
+            .add_systems(
+                Update,
+                library_status_text.run_if(in_state(AppState::Settings)),
             );
     }
 }
@@ -341,6 +347,7 @@ fn persist_settings(
 #[allow(clippy::type_complexity)] // Bevy 系统 Query 参数
 fn settings_actions(
     db: Res<SongsDb>,
+    scanner: Option<Res<SongScanner>>,
     mut bindings: ResMut<KeyBindingsByMode>,
     registry: Res<SettingsRegistry>,
     mut store: ResMut<SettingsStore>,
@@ -384,7 +391,7 @@ fn settings_actions(
         if keys.just_pressed(KeyCode::Escape) {
             state.input_active = false;
         } else if keys.just_pressed(KeyCode::Enter) {
-            add_folder_from_input(&db, &mut state);
+            add_folder_from_input(&db, &mut state, scanner.as_deref());
         } else {
             for event in kb.read() {
                 if !event.state.is_pressed() {
@@ -410,15 +417,20 @@ fn settings_actions(
             SettingsAction::FocusInput => {
                 state.input_active = !state.input_active;
             }
-            SettingsAction::AddFolder => add_folder_from_input(&db, &mut state),
+            SettingsAction::AddFolder => {
+                add_folder_from_input(&db, &mut state, scanner.as_deref());
+            }
             SettingsAction::RemoveFolder { path } => {
                 match db.remove_folder(path) {
-                    Ok(()) => state.status = Some(format!("已移除: {}", path.display())),
+                    Ok(()) => {
+                        // remove_folder 会连同该目录下的曲目记录一起删除，无需再扫描
+                        state.status = Some(format!("已移除: {}", path.display()));
+                    }
                     Err(e) => state.status = Some(format!("移除失败: {e}")),
                 }
                 state.rendered_folders.clear();
             }
-            SettingsAction::Rescan => run_scan(&db, &mut state),
+            SettingsAction::Rescan => run_scan(&db, &mut state, scanner.as_deref()),
             SettingsAction::BackToSelect => {
                 NextState::set_if_neq(&mut next, AppState::SongSelect);
             }
@@ -486,8 +498,12 @@ fn cycle_enum(registry: &SettingsRegistry, store: &mut SettingsStore, id: &'stat
     store.set(id, next.1.clone());
 }
 
-/// 从输入框内容添加文件夹并立即扫描。
-fn add_folder_from_input(db: &SongsDb, state: &mut SettingsUiState) {
+/// 从输入框内容添加文件夹，并交给后台扫描（不阻塞界面）。
+fn add_folder_from_input(
+    db: &SongsDb,
+    state: &mut SettingsUiState,
+    scanner: Option<&SongScanner>,
+) {
     let input = state.input.trim();
     if input.is_empty() {
         state.status = Some("请输入文件夹路径".into());
@@ -501,14 +517,26 @@ fn add_folder_from_input(db: &SongsDb, state: &mut SettingsUiState) {
     match db.add_folder(&path) {
         Ok(()) => {
             state.input.clear();
-            run_scan(db, state);
+            let root = path.canonicalize().unwrap_or_else(|_| path.clone());
+            if let Some(scanner) = scanner {
+                scanner.request_scan_roots(vec![root]);
+                state.status = Some(format!("已添加目录，后台扫描中: {}", path.display()));
+            } else {
+                run_scan(db, state, scanner);
+            }
         }
         Err(e) => state.status = Some(format!("添加失败: {e}")),
     }
 }
 
-/// 执行增量扫描并把报告写入状态文本。
-fn run_scan(db: &SongsDb, state: &mut SettingsUiState) {
+/// 请求一次后台增量扫描（结果通过 [`LibraryChanged`] 回到界面）。
+fn run_scan(db: &SongsDb, state: &mut SettingsUiState, scanner: Option<&SongScanner>) {
+    if let Some(scanner) = scanner {
+        scanner.request_scan_all();
+        state.status = Some(String::from("后台扫描中…"));
+        return;
+    }
+    // 无扫描器（理论上不会发生）：退化为同步扫描
     match db.scan() {
         Ok(report) => {
             state.status = Some(report.to_string());
@@ -524,6 +552,30 @@ fn run_scan(db: &SongsDb, state: &mut SettingsUiState) {
         }
     }
     state.rendered_folders.clear();
+}
+
+/// 把后台扫描的进度/完成状态写入界面状态文本。
+fn library_status_text(
+    mut changed: MessageReader<LibraryChanged>,
+    mut progress: MessageReader<LibraryProgress>,
+    status: Res<LibraryStatus>,
+    mut state: ResMut<SettingsUiState>,
+) {
+    for event in changed.read() {
+        state.status = Some(format!("扫描完成：{}", event.report));
+        state.rendered_folders.clear();
+    }
+    if status.scanning {
+        let mut latest = None;
+        for event in progress.read() {
+            latest = Some(event);
+        }
+        if let Some(event) = latest {
+            state.status = Some(format!("扫描中… {}/{}", event.done, event.total));
+        }
+    } else {
+        progress.clear();
+    }
 }
 
 // ---------- 渲染刷新 ----------
