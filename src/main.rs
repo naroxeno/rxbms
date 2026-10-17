@@ -62,8 +62,11 @@ fn main() {
                     ..default()
                 })
                 .set(LogPlugin {
-                    // 压制 icu_provider 的日语分词模型噪音（Bevy 内部已知问题，见 Cargo.toml 注释）
-                    filter: format!("{DEFAULT_FILTER},icu_provider=error"),
+                    // 压制 icu_provider 的日语分词模型噪音（Bevy 内部已知问题，见 Cargo.toml 注释）；
+                    // symphonia 解码 WAV 时会对每个非音频 chunk（bext/junk/…）打 INFO，纯噪音
+                    filter: format!(
+                        "{DEFAULT_FILTER},icu_provider=error,symphonia=warn,symphonia_format_riff=warn"
+                    ),
                     ..default()
                 })
                 // 音频自行管理（kira 驱动，见 audio.rs；禁用 Bevy 内置避免双输出流冲突）

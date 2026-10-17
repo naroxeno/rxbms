@@ -324,7 +324,7 @@ fn tick_gameplay(
                 if let Some(id) = wav_id
                     && let Some(path) = session.loaded.wav_paths.get(id)
                 {
-                    audio.play_synced(path);
+                    audio.play_synced(id.value() as u32, path);
                 }
             }
             ChartEvent::Note {
@@ -336,7 +336,7 @@ fn tick_gameplay(
                 if let Some(id) = wav_id
                     && let Some(path) = session.loaded.wav_paths.get(id)
                 {
-                    audio.play_synced(path);
+                    audio.play_synced(id.value() as u32, path);
                 }
                 if let Some(&idx) = session.loaded.note_by_event.get(&e.id.0) {
                     let key = session.loaded.notes[idx].key;
@@ -587,7 +587,7 @@ fn manual_input_judge(
             if let Some(id) = note.wav_id
                 && let Some(path) = session.loaded.wav_paths.get(&id)
             {
-                audio.play_synced(path);
+                audio.play_synced(id.value() as u32, path);
             }
             let is_ln = note.length.is_some();
             let lane = lanes.lane(key);

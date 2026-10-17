@@ -45,10 +45,10 @@ impl Plugin for SongDatabasePlugin {
 }
 
 /// 元数据提取版本：解析逻辑/字段变化时 +1，会强制全库重解析。
-pub const PARSE_VERSION: i64 = 1;
+pub const PARSE_VERSION: i64 = 2;
 
 /// 表结构版本（`PRAGMA user_version`）。
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 /// 单个铺面文件大小上限（超过视为异常文件，跳过并记录）。
 const MAX_CHART_BYTES: u64 = 8 * 1024 * 1024;
@@ -106,6 +106,8 @@ pub struct SongMeta {
     pub measure_count: usize,
     /// 解析告警数。
     pub warning_count: usize,
+    /// `#PREVIEW` 指向的预览音源（已解析为绝对路径，且确认文件存在）。
+    pub preview: Option<PathBuf>,
     /// 文件字节数。
     pub size: u64,
     /// 文件内容的 FNV-1a 64 哈希（内容身份，不随路径变化）。
@@ -218,9 +220,15 @@ struct Candidate {
     mtime_ns: i64,
 }
 
+/// 单文件解析的成功载荷（装箱：`SongMeta` 较大，避免枚举变体尺寸失衡）。
+struct ParsedSong {
+    meta: SongMeta,
+    facts: FileFacts,
+}
+
 /// 单个文件的解析结果。
 enum ParseOutcome {
-    Parsed { meta: SongMeta, facts: FileFacts },
+    Parsed(Box<ParsedSong>),
     Failed { path: PathBuf, error: String },
 }
 
@@ -302,7 +310,8 @@ impl SongsDb {
             .prepare(
                 "SELECT path, file_name, title, artist, genre, play_level, initial_bpm,
                         note_count, playable_count, bgm_count, bpm_change_count,
-                        stop_count, measure_count, warning_count, size, content_hash
+                        stop_count, measure_count, warning_count, size, content_hash,
+                        preview
                  FROM songs
                  WHERE active = 1 AND duplicate_of IS NULL
                  ORDER BY play_level IS NULL, play_level, file_name",
@@ -327,6 +336,7 @@ impl SongsDb {
                     warning_count: row.get::<_, i64>(13)? as usize,
                     size: row.get::<_, i64>(14)? as u64,
                     content_hash: row.get::<_, i64>(15)? as u64,
+                    preview: row.get::<_, Option<String>>(16)?.map(PathBuf::from),
                 })
             })
             .map_err(|e| format!("查询失败: {e}"))?;
@@ -581,6 +591,9 @@ impl SongsDb {
                         facts.content_hash,
                         PARSE_VERSION,
                         now_sec,
+                        meta.preview
+                            .as_ref()
+                            .map(|path| path.to_string_lossy().into_owned()),
                     ])
                     .map_err(|e| format!("写入失败: {e}"))?;
                     if is_new {
@@ -594,8 +607,8 @@ impl SongsDb {
 
             for outcome in outcomes {
                 match outcome {
-                    ParseOutcome::Parsed { meta, facts } => {
-                        batch.push((meta, facts));
+                    ParseOutcome::Parsed(parsed) => {
+                        batch.push((parsed.meta, parsed.facts));
                         if batch.len() >= WRITE_BATCH {
                             flush(&mut batch, &mut added, &mut updated)?;
                         }
@@ -754,6 +767,19 @@ impl SongsDb {
     /// # Errors
     ///
     /// SQL 查询失败时返回错误。
+    /// 是否有行不是用当前 [`PARSE_VERSION`] 解析的（版本升级后需要一次性重扫）。
+    pub fn needs_rescan(&self) -> bool {
+        let Ok(conn) = self.0.lock() else {
+            return false;
+        };
+        conn.query_row(
+            "SELECT COUNT(*) FROM songs WHERE parse_version != ?1",
+            [PARSE_VERSION],
+            |row| row.get::<_, i64>(0),
+        )
+        .is_ok_and(|count| count > 0)
+    }
+
     pub fn count(&self) -> Result<usize, String> {
         let conn = self.0.lock().map_err(|_| "songs.db 锁失效")?;
         conn.query_row(
@@ -778,6 +804,7 @@ CREATE TABLE IF NOT EXISTS songs (
     title TEXT,
     artist TEXT,
     genre TEXT,
+    preview TEXT,
     play_level INTEGER,
     initial_bpm REAL,
     note_count INTEGER NOT NULL DEFAULT 0,
@@ -813,9 +840,9 @@ const UPSERT_SQL: &str = r"
 INSERT INTO songs (path, root, file_name, title, artist, genre, play_level, initial_bpm,
                    note_count, playable_count, bgm_count, bpm_change_count, stop_count,
                    measure_count, warning_count, size, mtime_ns, content_hash,
-                   parse_version, last_seen, active, duplicate_of)
+                   parse_version, last_seen, active, duplicate_of, preview)
 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17,
-        ?18, ?19, ?20, 1, NULL)
+        ?18, ?19, ?20, 1, NULL, ?21)
 ON CONFLICT(path) DO UPDATE SET
     root = excluded.root,
     file_name = excluded.file_name,
@@ -837,7 +864,8 @@ ON CONFLICT(path) DO UPDATE SET
     parse_version = excluded.parse_version,
     last_seen = excluded.last_seen,
     active = 1,
-    duplicate_of = NULL
+    duplicate_of = NULL,
+    preview = excluded.preview
 ";
 
 /// 旧库迁移：缺列就 ALTER 补齐，并删除已废弃的 `file_modified`。
@@ -846,7 +874,7 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     let existing: HashSet<String> = stmt
         .query_map([], |row| row.get::<_, String>(1))?
         .collect::<Result<_, _>>()?;
-    let wanted: [(&str, &str); 9] = [
+    let wanted: [(&str, &str); 10] = [
         ("root", "TEXT NOT NULL DEFAULT ''"),
         ("warning_count", "INTEGER NOT NULL DEFAULT 0"),
         ("size", "INTEGER NOT NULL DEFAULT 0"),
@@ -856,6 +884,7 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
         ("active", "INTEGER NOT NULL DEFAULT 1"),
         ("duplicate_of", "TEXT"),
         ("last_seen", "INTEGER NOT NULL DEFAULT 0"),
+        ("preview", "TEXT"),
     ];
     for (name, ddl) in wanted {
         if !existing.contains(name) {
@@ -1015,7 +1044,7 @@ fn parse_parallel(
 /// 解析单个文件。任何错误（含 bms-rs 内部 panic）都转成 `Failed`，绝不让扫描中断。
 fn parse_one(path: &Path) -> ParseOutcome {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| parse_file(path))) {
-        Ok(Ok((meta, facts))) => ParseOutcome::Parsed { meta, facts },
+        Ok(Ok((meta, facts))) => ParseOutcome::Parsed(Box::new(ParsedSong { meta, facts })),
         Ok(Err(error)) => ParseOutcome::Failed {
             path: path.to_path_buf(),
             error,
@@ -1096,6 +1125,10 @@ fn parse_meta(
             .last_obj_time()
             .map_or(0, |t| usize::try_from(t.track().0).unwrap_or(0) + 1),
         warning_count: output.warnings.len(),
+        preview: bms.music_info.preview_music.as_ref().and_then(|relative| {
+            let absolute = path.parent().map(|dir| dir.join(relative))?;
+            absolute.is_file().then_some(absolute)
+        }),
         size,
         content_hash,
     })
@@ -1181,10 +1214,17 @@ fn bootstrap_database(
         Err(e) => warn!("[song-database] 读取计数失败: {e}"),
     }
 
-    // 后台扫描 worker：启动时不自动扫描，只在用户显式刷新时工作
+    // 后台扫描 worker：启动时不自动扫描，只在用户显式刷新时工作；
+    // 例外是元数据版本升级（`PARSE_VERSION` 变化）——旧行缺新字段，
+    // 启动时后台补扫一次，之后的启动就不再扫。
     let scanner = crate::library::SongScanner::spawn(db.clone());
+    if db.needs_rescan() {
+        info!("[song-database] 元数据版本升级，后台重扫曲库一次");
+        scanner.request_scan_all();
+    }
     commands.insert_resource(scanner);
     commands.insert_resource(db);
+
     next.set(AppState::SongSelect);
 }
 
@@ -1352,6 +1392,61 @@ mod tests {
         assert_eq!(meta.bgm_count, 1);
         assert_eq!(meta.measure_count, 2);
         assert_eq!(meta.content_hash, content_hash(MINI_BMS.as_bytes()));
+    }
+
+    /// `#PREVIEW` 解析：文件存在时存绝对路径，缺失时为 `None`。
+    #[test]
+    fn preview_points_to_existing_audio() {
+        let dir = std::env::temp_dir().join(format!("rxbms_test_preview_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("preview.ogg"), b"fake").unwrap();
+
+        let with_preview = dir.join("a.bms");
+        fs::write(
+            &with_preview,
+            "#TITLE A\n#BPM 120\n#PREVIEW preview.ogg\n#WAV01 k.wav\n#00111:01\n",
+        )
+        .unwrap();
+        let meta = parse_chart(&with_preview).expect("解析应成功");
+        assert_eq!(
+            meta.preview.as_deref(),
+            Some(dir.join("preview.ogg").as_path()),
+            "预览音源应解析为绝对路径"
+        );
+
+        let broken = dir.join("b.bms");
+        fs::write(
+            &broken,
+            "#TITLE B\n#BPM 120\n#PREVIEW missing.ogg\n#WAV01 k.wav\n#00111:01\n",
+        )
+        .unwrap();
+        let meta = parse_chart(&broken).expect("解析应成功");
+        assert_eq!(meta.preview, None, "文件不存在时不应记录预览音源");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 版本升级标记：解析版本变化后需要重扫，重扫后不再需要。
+    #[test]
+    fn needs_rescan_after_parse_version_bump() {
+        let temp = TempDb::new("needs_rescan");
+        let db = SongsDb::open_at(temp.db_path()).unwrap();
+        assert!(!db.needs_rescan(), "空库不需要重扫");
+
+        let dir = temp.0.join("charts");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("a.bms"), MINI_BMS).unwrap();
+        db.scan_roots(std::slice::from_ref(&dir)).unwrap();
+        assert!(!db.needs_rescan(), "刚扫过不需要重扫");
+
+        // 模拟旧版本遗留的行
+        {
+            let conn = db.0.lock().unwrap();
+            conn.execute("UPDATE songs SET parse_version = ?1", [PARSE_VERSION - 1])
+                .unwrap();
+        }
+        assert!(db.needs_rescan(), "旧解析版本应触发重扫");
     }
 
     #[test]

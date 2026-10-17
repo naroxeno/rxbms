@@ -4,7 +4,7 @@
 //! - **管理器**（第 1-2 章）：`kira::AudioManager<DefaultBackend>` 单实例 Resource，
 //!   后台音频线程渲染，主线程零阻塞；
 //! - **播放**（第 3 章）：键音与小 BGM 采样 = `StaticSoundData`（`Arc` 共享采样、
-//!   克隆廉价、可多路并发，**并发受控**——同一 keysound 最多 2 个实例同时发声
+//!   克隆廉价、可多路并发，**并发受控**——同一 `#WAV` 槽位最多 2 个实例同时发声
 //!   （LN 密集键音停旧播新，不叠加淹没 BGM）、键音轨总量上限 32）；大 BGM
 //!   （≥ 2MB）= `StreamingSoundData`（流式后台解码，整曲不占内存）；参数
 //!   （音量/播放速率/声像）支持 `Tween` 平滑过渡；
@@ -81,18 +81,23 @@ const STREAMING_MIN_BYTES: u64 = 2_000_000;
 /// 也走静态缓存——否则每次事件停旧流重开，背景音被掐断。
 const STREAMING_MAX_EVENTS: usize = 8;
 
-/// 同一 keysound 文件在键音轨上允许的最大并发实例数。
+/// 同一 **#WAV 槽位**在键音轨上允许的最大并发实例数。
 ///
 /// BMS 谱面的长音持续音常由 LN body 内**密集引用同一 wav** 的键音事件实现
 /// （每 16/32 分音符一个）。若每个事件都新建一个实例且互不干扰，多个实例
 /// 波形叠加会**盖过 BGM**（用户报告：听不见 BGM）。超过上限时停止最旧的
-/// 同路径实例再播新的——发声不丢、叠加受控。
-const KEYSOUND_MAX_PER_PATH: usize = 2;
+/// 同槽位实例再播新的——发声不丢、叠加受控。
+///
+/// 计数单位是**槽位（`#WAV` 的 id）而不是文件路径**：谱师把同一个 wav 定义成
+/// 多个槽位（01/02/03/04 指向同一文件）是 BMS 里写音量的标准手法——同时发声
+/// 数 +1 即音量叠 N 倍（BMS command memo「多重定義」章节）；按路径计数会把
+/// 4 层叠音削成 2 层，听感比谱面意图轻一半。
+const KEYSOUND_MAX_PER_SLOT: usize = 2;
 
 /// 键音轨并发实例总上限（极端谱面兜底；kira 轨道默认容量 128）。
 ///
 /// 多条轨道同时按住 LN + 常规键音密集出现时，无上限会撑满轨道容量并
-/// 大量堆叠；此处丢弃超限的本次发声（同时同路径限制已保证主流场景不触发）。
+/// 大量堆叠；此处丢弃超限的本次发声（同时同槽位限制已保证主流场景不触发）。
 const KEYSOUND_MAX_TOTAL: usize = 32;
 
 /// 连续音频（"背景床"）判据：采样时长 ≥ 铺面总时长 × 该比例。
@@ -182,9 +187,9 @@ pub struct AudioManager {
     /// 全局音量（0.0–1.0，线性 → main track 的 dB 音量）。
     volume: f32,
     /// 键音轨上正在播放的声音实例（静态或流式），
-    /// 供同路径并发控制与已结束实例清理（防堆积）。
+    /// 供同槽位并发控制与已结束实例清理（防堆积）。
     keysound_voices: Vec<KeysoundVoice>,
-    /// 键音并发限制器（同路径计数 + 总量上限，纯逻辑可测）。
+    /// 键音并发限制器（同槽位计数 + 总量上限，纯逻辑可测）。
     keysound_limiter: KeysoundLimiter,
     /// 本场铺面总时长（秒），连续音频判据 [`is_bed_audio`] 的分母。
     ///
@@ -402,7 +407,10 @@ impl AudioManager {
 
     /// 播放一个音频（键音路径）。
     ///
-    /// 多路并发**受控**：同一路径最多 [`KEYSOUND_MAX_PER_PATH`] 个实例同时发声
+    /// `slot` 是 `#WAV` 槽位 id（`WavId`）：并发上限按**槽位**而不是路径计数，
+    /// 因此多个槽位指向同一文件时可以叠音（谱面用多槽位写音量的标准手法）。
+    ///
+    /// 多路并发**受控**：同一槽位最多 [`KEYSOUND_MAX_PER_SLOT`] 个实例同时发声
     /// （超出时停止最旧的再播新——LN 密集键音不叠加淹没 BGM，按键/事件也保证
     /// 发声）；全部键音合计最多 [`KEYSOUND_MAX_TOTAL`] 个。已结束的实例每帧
     /// 清理（见 [`AudioManager::prune_keysound_voices`]）。
@@ -413,47 +421,47 @@ impl AudioManager {
     /// **统一受并发上限约束**，流式实例不因无缓存而无限叠加。
     ///
     /// 返回是否实际发起播放（解码失败、轨道缺失或总量超限时为 `false`）。
-    pub fn play_synced(&mut self, path: &Path) -> bool {
+    pub fn play_synced(&mut self, slot: u32, path: &Path) -> bool {
         self.ensure_song_tracks();
-        // 并发控制：先清理已结束实例，再为同路径腾出配额（停最旧），
+        // 并发控制：先清理已结束实例，再为同槽位腾出配额（停最旧），
         // 最后检查总量上限。
         self.prune_keysound_voices();
-        self.keysound_make_room(path);
-        if !self.keysound_limiter.try_acquire(path, KEYSOUND_MAX_TOTAL) {
+        self.keysound_make_room(slot);
+        if !self.keysound_limiter.try_acquire(slot, KEYSOUND_MAX_TOTAL) {
+            debug!("[audio] 丢音：键音总量超限（slot={slot}，cap={KEYSOUND_MAX_TOTAL}）");
             return false; // 总量超限（极端谱面兜底）：丢弃本次发声
         }
         let streaming = !self.should_cache(path);
         let Some(keysound) = self.tracks.keysound.as_mut() else {
-            self.keysound_limiter.release(path);
+            self.keysound_limiter.release(slot);
             return false;
         };
         if !streaming {
             // 静态缓存：priority 预解码命中直接播；未命中同步解码一次并缓存
             let data = match self.cache.get(path) {
-                Some(data) => data.clone(),
+                Some(data) => {
+                    data.clone()
+                }
                 None => match StaticSoundData::from_file(path) {
                     Ok(data) => {
                         self.cache.insert_ready(path.to_path_buf(), data.clone());
                         data
                     }
                     Err(e) => {
-                        warn!("[audio] 同步解码失败 {}: {e}", path.display());
-                        self.keysound_limiter.release(path);
+                    warn!("[audio] 同步解码失败 {}: {e}", path.display());
+                        self.keysound_limiter.release(slot);
                         return false;
                     }
                 },
             };
             match keysound.play(data) {
                 Ok(handle) => {
-                    self.keysound_voices.push(KeysoundVoice::Static {
-                        path: path.to_path_buf(),
-                        handle,
-                    });
+                    self.keysound_voices.push(KeysoundVoice::Static { slot, handle });
                     true
                 }
                 Err(e) => {
                     warn!("[audio] 键音播放失败 {}: {e}", path.display());
-                    self.keysound_limiter.release(path);
+                    self.keysound_limiter.release(slot);
                     false
                 }
             }
@@ -462,21 +470,18 @@ impl AudioManager {
             match StreamingSoundData::from_file(path) {
                 Ok(data) => match keysound.play(data) {
                     Ok(handle) => {
-                        self.keysound_voices.push(KeysoundVoice::Streaming {
-                            path: path.to_path_buf(),
-                            handle,
-                        });
+                        self.keysound_voices.push(KeysoundVoice::Streaming { slot, handle });
                         true
                     }
                     Err(e) => {
                         warn!("[audio] 键音流式播放失败 {}: {e}", path.display());
-                        self.keysound_limiter.release(path);
+                        self.keysound_limiter.release(slot);
                         false
                     }
                 },
                 Err(e) => {
                     warn!("[audio] 键音流式解码失败 {}: {e}", path.display());
-                    self.keysound_limiter.release(path);
+                    self.keysound_limiter.release(slot);
                     false
                 }
             }
@@ -491,29 +496,30 @@ impl AudioManager {
         while i < self.keysound_voices.len() {
             if !self.keysound_voices[i].is_playing() {
                 let voice = self.keysound_voices.remove(i);
-                self.keysound_limiter.release(voice.path());
+                self.keysound_limiter.release(voice.slot());
             } else {
                 i += 1;
             }
         }
     }
 
-    /// 同路径并发达到上限时，**停止最旧的同路径实例**（腾出配额再播新）。
+    /// 同槽位并发达到上限时，**停止最旧的同槽位实例**（腾出配额再播新）。
     ///
     /// LN 持续音事件密集触发同一 wav：若放任叠加会盖过 BGM；停旧播新让
-    /// 发声连续且每次事件都出声，同时该路径并发数恒 ≤ [`KEYSOUND_MAX_PER_PATH`]。
-    fn keysound_make_room(&mut self, path: &Path) {
-        while self.keysound_limiter.count(path) >= KEYSOUND_MAX_PER_PATH {
+    /// 发声连续且每次事件都出声，同时该槽位并发数恒 ≤ [`KEYSOUND_MAX_PER_SLOT`]。
+    fn keysound_make_room(&mut self, slot: u32) {
+        while self.keysound_limiter.count(slot) >= KEYSOUND_MAX_PER_SLOT {
             let Some(pos) = self
                 .keysound_voices
                 .iter()
-                .position(|v| v.path() == path)
+                .position(|v| v.slot() == slot)
             else {
                 break;
             };
             let mut voice = self.keysound_voices.remove(pos);
             voice.stop();
-            self.keysound_limiter.release(voice.path());
+            self.keysound_limiter.release(voice.slot());
+            trace!("[audio] 截断：同槽位并发达到上限（slot={slot}）");
         }
     }
 
@@ -570,8 +576,12 @@ impl AudioManager {
             path,
         );
         match action {
-            BgmEventAction::Ignore => true,
-            BgmEventAction::Start => self.start_long_bgm(path, data),
+            BgmEventAction::Ignore => {
+                true
+            }
+            BgmEventAction::Start => {
+                self.start_long_bgm(path, data)
+            }
             BgmEventAction::OneShot => self.play_bgm_sample(data),
         }
     }
@@ -633,6 +643,7 @@ impl AudioManager {
         while self.bgm_samples.len() >= BGM_SAMPLE_MAX_VOICES {
             let mut oldest = self.bgm_samples.remove(0);
             oldest.stop(Tween::default());
+            debug!("[audio] 截断：BGM 采样并发达到上限（cap={BGM_SAMPLE_MAX_VOICES}）");
         }
         let Some(sample_track) = self.tracks.bgm_sample.as_mut() else {
             return false;
@@ -703,6 +714,31 @@ impl AudioManager {
             },
             Err(e) => {
                 warn!("[audio] 主界面 BGM 解码失败 {}: {e}", path.display());
+                false
+            }
+        }
+    }
+
+    /// 选曲预览：把 `#PREVIEW` 音源放在主界面轨上**循环**播放（对齐 beatoraja
+    /// 默认的 `SongPreview.LOOP`）。
+    ///
+    /// 与 [`Self::play_menu_bgm`] 共用 `menu` 轨与 `stop_menu_bgm` 的停止路径；
+    /// 流式解码 + `loop_region(0.0..)`，不占静态缓存。
+    pub fn play_preview_loop(&mut self, path: &Path) -> bool {
+        self.stop_menu_bgm();
+        match StreamingSoundData::from_file(path).map(|data| data.loop_region(0.0..)) {
+            Ok(data) => match self.tracks.menu.play(data) {
+                Ok(handle) => {
+                    self.menu_handle = Some(handle);
+                    true
+                }
+                Err(e) => {
+                    warn!("[audio] 预览循环播放失败 {}: {e}", path.display());
+                    false
+                }
+            },
+            Err(e) => {
+                warn!("[audio] 预览音源解码失败 {}: {e}", path.display());
                 false
             }
         }
@@ -815,18 +851,19 @@ fn is_streaming_path(streaming: &HashSet<PathBuf>, path: &Path) -> bool {
 /// 键音轨上的一个播放中实例（静态缓存或流式大文件），统一并发管理。
 enum KeysoundVoice {
     /// 静态缓存采样（普通键音/小 BGM 采样）。
-    Static { path: PathBuf, handle: StaticSoundHandle },
+    Static { slot: u32, handle: StaticSoundHandle },
     /// 流式大文件（≥2MB 且被标记流式 BGM，键音事件引用时流式播放）。
     Streaming {
-        path: PathBuf,
+        slot: u32,
         handle: StreamingSoundHandle<FromFileError>,
     },
 }
 
 impl KeysoundVoice {
-    fn path(&self) -> &Path {
+    /// 所属 `#WAV` 槽位 id（并发计数键）。
+    fn slot(&self) -> u32 {
         match self {
-            Self::Static { path, .. } | Self::Streaming { path, .. } => path,
+            Self::Static { slot, .. } | Self::Streaming { slot, .. } => *slot,
         }
     }
 
@@ -849,37 +886,40 @@ impl KeysoundVoice {
 
 /// 键音并发限制器（纯逻辑，无设备依赖，可单测）。
 ///
-/// 维护「路径 → 正在播放的实例数」，配合 [`AudioManager::keysound_voices`]
-/// 实现同路径/总量双重上限。实例播完由 `prune` 归还计数，轨道销毁由
-/// [`Self::clear`] 整体重置。
+/// 维护「`#WAV` 槽位 id → 正在播放的实例数」，配合
+/// [`AudioManager::keysound_voices`] 实现同槽位/总量双重上限。实例播完由
+/// `prune` 归还计数，轨道销毁由 [`Self::clear`] 整体重置。
+///
+/// 计数键是**槽位**而非路径：不同槽位指向同一文件时互不挤占，谱面的多槽位
+/// 叠音（BMS 写音量的标准手法）才能按预期叠加。
 #[derive(Debug, Default)]
 struct KeysoundLimiter {
-    counts: HashMap<PathBuf, usize>,
+    counts: HashMap<u32, usize>,
 }
 
 impl KeysoundLimiter {
-    /// 该路径当前并发实例数。
-    fn count(&self, path: &Path) -> usize {
-        self.counts.get(path).copied().unwrap_or(0)
+    /// 该槽位当前并发实例数。
+    fn count(&self, slot: u32) -> usize {
+        self.counts.get(&slot).copied().unwrap_or(0)
     }
 
     /// 尝试占用一个并发配额：总实例数达上限时拒绝（返回 `false`），
     /// 否则计数 +1 并返回 `true`。
-    fn try_acquire(&mut self, path: &Path, max_total: usize) -> bool {
+    fn try_acquire(&mut self, slot: u32, max_total: usize) -> bool {
         let total: usize = self.counts.values().sum();
         if total >= max_total {
             return false;
         }
-        *self.counts.entry(path.to_path_buf()).or_insert(0) += 1;
+        *self.counts.entry(slot).or_insert(0) += 1;
         true
     }
 
     /// 归还一个并发配额（实例已结束/被停止）。
-    fn release(&mut self, path: &Path) {
-        if let Some(n) = self.counts.get_mut(path) {
+    fn release(&mut self, slot: u32) {
+        if let Some(n) = self.counts.get_mut(&slot) {
             *n = n.saturating_sub(1);
             if *n == 0 {
-                self.counts.remove(path);
+                self.counts.remove(&slot);
             }
         }
     }
@@ -1111,7 +1151,7 @@ pub struct AudioManagerPlugin;
 impl Plugin for AudioManagerPlugin {
     fn build(&self, app: &mut App) {
         app.add_systems(Startup, init_audio_manager)
-            .add_systems(Update, (sync_volume, drain_audio_manager));
+            .add_systems(Update, (sync_volume, drain_audio_manager).chain());
     }
 }
 
@@ -1156,50 +1196,65 @@ mod tests {
     }
 
     #[test]
-    fn keysound_limiter_per_path_count_and_release() {
+    fn keysound_limiter_per_slot_count_and_release() {
         let mut l = KeysoundLimiter::default();
-        let a = PathBuf::from("/ln.wav");
-        let b = PathBuf::from("/tap.wav");
 
-        // 同路径多次 acquire：计数累加
-        assert!(l.try_acquire(&a, KEYSOUND_MAX_TOTAL));
-        assert!(l.try_acquire(&a, KEYSOUND_MAX_TOTAL));
-        assert_eq!(l.count(&a), 2);
-        assert_eq!(l.count(&b), 0);
+        // 同槽位多次 acquire：计数累加
+        assert!(l.try_acquire(1, KEYSOUND_MAX_TOTAL));
+        assert!(l.try_acquire(1, KEYSOUND_MAX_TOTAL));
+        assert_eq!(l.count(1), 2);
+        assert_eq!(l.count(2), 0);
 
         // release 归还计数，归零后移除
-        l.release(&a);
-        assert_eq!(l.count(&a), 1);
-        l.release(&a);
-        assert_eq!(l.count(&a), 0);
+        l.release(1);
+        assert_eq!(l.count(1), 1);
+        l.release(1);
+        assert_eq!(l.count(1), 0);
+    }
+
+    /// 谱面用「多个 `#WAV` 槽位指向同一文件」叠音量：并发计数必须按槽位分开，
+    /// 否则 4 层叠音会被削到 [`KEYSOUND_MAX_PER_SLOT`] 层（听感变轻）。
+    #[test]
+    fn keysound_limiter_counts_per_slot_not_per_path() {
+        let mut l = KeysoundLimiter::default();
+        // 槽位 1..=4 指向同一路径：彼此独立计数，互不挤占
+        for slot in 1..=4 {
+            assert!(
+                l.try_acquire(slot, KEYSOUND_MAX_TOTAL),
+                "槽位 {slot} 应与其它槽位独立计数"
+            );
+        }
+        for slot in 1..=4 {
+            assert_eq!(l.count(slot), 1);
+        }
     }
 
     #[test]
     fn keysound_limiter_total_cap_rejects_and_recovers() {
         let mut l = KeysoundLimiter::default();
-        // 占满总量（不同路径）
-        for i in 0..KEYSOUND_MAX_TOTAL {
+        // 占满总量（不同槽位）
+        for slot in 0..KEYSOUND_MAX_TOTAL as u32 {
             assert!(
-                l.try_acquire(&PathBuf::from(format!("/k{i}.wav")), KEYSOUND_MAX_TOTAL),
-                "第 {i} 个应占用成功"
+                l.try_acquire(slot, KEYSOUND_MAX_TOTAL),
+                "第 {slot} 个应占用成功"
             );
         }
         // 超限拒绝
-        assert!(!l.try_acquire(&PathBuf::from("/overflow.wav"), KEYSOUND_MAX_TOTAL));
+        assert!(!l.try_acquire(0xFFFF, KEYSOUND_MAX_TOTAL));
         // 释放一个后恢复
-        l.release(&PathBuf::from("/k0.wav"));
-        assert!(l.try_acquire(&PathBuf::from("/overflow.wav"), KEYSOUND_MAX_TOTAL));
+        l.release(0);
+        assert!(l.try_acquire(0xFFFF, KEYSOUND_MAX_TOTAL));
     }
 
     #[test]
     fn keysound_limiter_clear_resets_all() {
         let mut l = KeysoundLimiter::default();
-        l.try_acquire(&PathBuf::from("/a.wav"), KEYSOUND_MAX_TOTAL);
-        l.try_acquire(&PathBuf::from("/b.wav"), KEYSOUND_MAX_TOTAL);
+        l.try_acquire(1, KEYSOUND_MAX_TOTAL);
+        l.try_acquire(2, KEYSOUND_MAX_TOTAL);
         l.clear();
-        assert_eq!(l.count(&PathBuf::from("/a.wav")), 0);
-        assert_eq!(l.count(&PathBuf::from("/b.wav")), 0);
-        assert!(l.try_acquire(&PathBuf::from("/a.wav"), KEYSOUND_MAX_TOTAL));
+        assert_eq!(l.count(1), 0);
+        assert_eq!(l.count(2), 0);
+        assert!(l.try_acquire(1, KEYSOUND_MAX_TOTAL));
     }
 
     #[test]
