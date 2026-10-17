@@ -1,3 +1,11 @@
 /target
 /ref
 probe_src/
+
+# 本地 fork 的 bms-rs 工作副本（依赖走 git 分支，见 Cargo.toml）
+/.fork/
+# 工具/运行残渣
+/.reasonix/
+/play.log
+# 内嵌的独立文档仓库（有自己的 git）
+/rxbms-docs/

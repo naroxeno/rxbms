@@ -5,7 +5,9 @@ edition = "2024"
 
 [dependencies]
 bevy = { version = "0.19.0", features = ["serialize"] }
-bms-rs = { git = "https://github.com/naroxeno/bms-rs.git", version = "1.0.0" , branch = "fix-chart-off-by-one-error"}
+# BMS 解析：指向 fork 分支（含 y=0 首帧事件、STOP 时长修复），
+# 不再用本地 path 依赖——`.fork/` 不入库，path 依赖会让仓库无法构建
+bms-rs = { git = "https://github.com/naroxeno/bms-rs.git", branch = "fix-stop-duration-ms" }
 # BMS 文件常用 Shift_JIS 编码，bms-rs 只接受 UTF-8，需要转码
 encoding_rs = "0.8"
 # 配置持久化（~/.rxbms/config.json，键位绑定等）
@@ -31,7 +33,7 @@ mlua = { version = "0.12.0", features = ["luajit"] }
 # 跨平台说明：
 # - 默认动态链接：Linux 需 libav*-dev，Windows 需 ffmpeg DLL，macOS 需 brew ffmpeg；
 # - 启用 `static-ffmpeg` feature 可静态编译（自包含，需 C 工具链，编译较慢）。
-ffmpeg-next = { version = "8.1.0", default-features = false, features = ["codec", "format", "software-scaling"] }
+ffmpeg-next = { version = "9.0.0", default-features = false, features = ["codec", "format", "software-scaling"] }
 
 [features]
 # 静态编译 ffmpeg（跨平台自包含构建，无需系统 ffmpeg）
