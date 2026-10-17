@@ -111,10 +111,10 @@ impl LoadedChart {
             .clone()
             .unwrap_or_else(|| "untitled".into());
 
-        // 提取全部事件（y 从 0 到无穷）
-        let all = chart
-            .events()
-            .events_in_y_range(YCoordinate::ZERO..);
+        // 全部事件（`as_events()` 返回内部主事件表的**切片**，不克隆；
+        // 旧写法 `events_in_y_range(YCoordinate::ZERO..)` 会把整个事件向量 clone
+        // 一份再丢弃——大谱面（数万事件）在加载时白白多占一份事件内存）
+        let all = chart.events().as_events();
 
         let mut notes: Vec<NoteView> = Vec::new();
         let mut max_time = 0.0_f64;
@@ -123,7 +123,7 @@ impl LoadedChart {
 
         // 第一遍：收集全部出现过的轨道键（去重）
         let mut key_set: Vec<Key> = Vec::new();
-        for pe in &all {
+        for pe in all {
             if let ChartEvent::Note {
                 side: PlayerSide::Player1,
                 key,
@@ -147,7 +147,7 @@ impl LoadedChart {
             .collect();
 
         // 第二遍：提取音符
-        for pe in &all {
+        for pe in all {
             let t = pe.activate_time.as_secs_f64();
             if t > max_time {
                 max_time = t;
@@ -165,6 +165,17 @@ impl LoadedChart {
                     // 忽略踏板与自由区（暂不支持）
                     if matches!(key, Key::FootPedal | Key::FreeZone) {
                         continue;
+                    }
+                    // LN 尾部结束时间计入谱面总时长（BPM 分段累积）——否则超时
+                    // 兜底（total_sec + 3s）会在长音尾部尚未放完时触发，
+                    // 谱面提前结束（画面卡住等音乐）。
+                    if *kind == NoteKind::Long
+                        && let Some(len) = length
+                    {
+                        let tail_sec = t + Self::ln_length_sec(pe.position, *len, &chart);
+                        if tail_sec > max_time {
+                            max_time = tail_sec;
+                        }
                     }
                     // 隐形 note（通道 3x/4x）：不渲染、不参与判定，
                     // 键音由 ChartPlayer 事件实时触发（beatoraja 语义）。
@@ -238,6 +249,26 @@ fn lane_order(key: Key) -> (u8, u8) {
     }
 }
 
+/// LN 尾部相对 head 的时长（秒）：measure → 秒（BPM 分段累积，与播放头同源，
+/// 见 [`crate::gameplay::measure_seconds`]）。
+fn ln_length_sec(head_y: YCoordinate, len: NonNegativeF64, chart: &Arc<Chart>) -> f64 {
+    let mut bpm_changes: Vec<(f64, f64)> = Vec::new();
+    for (y, flows) in chart.flow_events() {
+        for f in flows {
+            if let FlowEvent::Bpm(b) = f {
+                bpm_changes.push((y.as_f64(), b.as_f64()));
+            }
+        }
+    }
+    bpm_changes.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    crate::gameplay::measure_seconds(
+        head_y.0.as_f64(),
+        len.as_f64(),
+        &bpm_changes,
+        chart.init_bpm().as_f64(),
+    )
+}
+
 /// 音符总数（标题栏显示）。
     #[must_use]
     pub fn note_count(&self) -> usize {
@@ -250,8 +281,8 @@ fn lane_order(key: Key) -> (u8, u8) {
     #[must_use]
     pub fn priority_audio_paths(&self, deadline_sec: f64) -> std::collections::HashSet<PathBuf> {
         let mut set = std::collections::HashSet::new();
-        let all = self.chart.events().events_in_y_range(YCoordinate::ZERO..);
-        for pe in &all {
+        let all = self.chart.events().as_events();
+        for pe in all {
             if pe.activate_time.as_secs_f64() > deadline_sec {
                 continue;
             }
@@ -276,8 +307,8 @@ fn lane_order(key: Key) -> (u8, u8) {
     #[must_use]
     pub fn bgm_audio_stats(&self) -> std::collections::HashMap<PathBuf, usize> {
         let mut stats = std::collections::HashMap::new();
-        let all = self.chart.events().events_in_y_range(YCoordinate::ZERO..);
-        for pe in &all {
+        let all = self.chart.events().as_events();
+        for pe in all {
             if let ChartEvent::Bgm { wav_id: Some(id) } = &pe.event
                 && let Some(p) = self.wav_paths.get(id)
             {
@@ -285,6 +316,36 @@ fn lane_order(key: Key) -> (u8, u8) {
             }
         }
         stats
+    }
+
+    /// 音频预加载时间线：每条音频路径**首次**被事件触发的时间（秒），按时间升序。
+    ///
+    /// 供 [`crate::audio::AudioManager::set_preload_timeline`] 做滚动窗口预加载：
+    /// 只解码"即将播放"的音频，而不是整张谱面的全部音频（数千键音 = 数百 MB）。
+    /// 同一路径只登记一次（后续事件复用缓存；被 LRU 淘汰后再次触发会同步解码补回）。
+    #[must_use]
+    pub fn audio_timeline(&self) -> Vec<(f64, PathBuf)> {
+        // 借用路径而非克隆：每个事件只做一次 hash 查找，最后统一 clone 一次。
+        let mut first: HashMap<&PathBuf, f64> = HashMap::new();
+        for pe in self.chart.events().as_events() {
+            let (ChartEvent::Bgm { wav_id: Some(id) }
+            | ChartEvent::Note { wav_id: Some(id), .. }) = &pe.event
+            else {
+                continue;
+            };
+            let Some(path) = self.wav_paths.get(id) else {
+                continue;
+            };
+            let sec = pe.activate_time.as_secs_f64();
+            first
+                .entry(path)
+                .and_modify(|t| *t = t.min(sec))
+                .or_insert(sec);
+        }
+        let mut timeline: Vec<(f64, PathBuf)> =
+            first.into_iter().map(|(path, sec)| (sec, path.clone())).collect();
+        timeline.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        timeline
     }
 
     /// 游玩模式：按谱面使用的最大键号判断（≤5 → 5K，否则 7K）。
@@ -319,7 +380,7 @@ fn extract_bga(
     // Base 层事件（带秒时间）
     let events: Vec<BgaEvent> = chart
         .events()
-        .events_in_y_range(YCoordinate::ZERO..)
+        .as_events()
         .iter()
         .filter_map(|pe| match &pe.event {
             ChartEvent::BgaChange {
@@ -440,4 +501,51 @@ mod tests {
         assert!(loaded.total_sec > 0.0);
     }
 
+    #[test]
+    fn total_sec_includes_ln_tail() {
+        // LN 从 measure 1 到 measure 3（BPM 120 → 2 measures = 4 秒）。
+        // bms-rs 跳过 LN end marker，只生成 head+length 一个事件——
+        // 若 total_sec 只算事件激活时间（= LN head 时刻），会漏掉尾部，
+        // 超时兜底（total_sec + 3s）在长音放完前触发 → 谱面提前结束。
+        let bms = "#BPM 120\n#WAV01 a.wav\n#00151:01\n#00351:01\n";
+        let path = temp_chart("ln_tail", bms);
+        let loaded = LoadedChart::load(&path).expect("加载 LN 迷你铺面");
+        assert_eq!(loaded.note_count(), 1, "应提取 1 个长音（end marker 被跳过）");
+        let ln = &loaded.notes[0];
+        assert!(ln.length.is_some(), "应为长音");
+        // total_sec 必须覆盖 LN 尾部（head + 4 秒）
+        assert!(
+            loaded.total_sec >= ln.activate_time + 3.5,
+            "total_sec {:.2} 应包含 LN 尾部（head {:.2} + 4s）",
+            loaded.total_sec,
+            ln.activate_time
+        );
+    }
+
+    #[test]
+    fn audio_timeline_sorted_by_first_event() {
+        // measure 1 的 BGM（0s）+ measure 4 的键音（BPM 120 → 6s）
+        let bms = "#BPM 120\n#WAV01 bgm.wav\n#WAV02 key1.wav\n#00101:01\n#00411:02\n";
+        let path = temp_chart("timeline", bms);
+        let dir = path.parent().expect("临时目录");
+        // 只是路径解析（`is_file` 检查），不解码 → 空文件即可
+        fs::write(dir.join("bgm.wav"), b"").expect("写 bgm 占位");
+        fs::write(dir.join("key1.wav"), b"").expect("写键音占位");
+        let loaded = LoadedChart::load(&path).expect("加载铺面");
+        assert_eq!(loaded.wav_paths.len(), 2, "两个 #WAV 都应解析到磁盘");
+        let timeline = loaded.audio_timeline();
+        assert_eq!(timeline.len(), 2, "每条路径只登记首次触发");
+        assert!(timeline[0].0 <= timeline[1].0, "时间线必须按时间升序");
+        assert_eq!(timeline[0].1.file_name().unwrap(), "bgm.wav");
+        assert_eq!(timeline[1].1.file_name().unwrap(), "key1.wav");
+        // 两条事件相隔 3 小节（BPM 120 → 2s/小节 = 6s）；
+        // 绝对起点取决于 bms-rs 的小节编号基准，这里只验证相对间隔。
+        assert!(
+            (timeline[1].0 - timeline[0].0 - 6.0).abs() < 1e-6,
+            "相隔应为 6s，实际 {}",
+            timeline[1].0 - timeline[0].0
+        );
+    }
+
 }
+

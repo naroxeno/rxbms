@@ -11,6 +11,7 @@ pub mod data;
 pub mod judge;
 pub mod lane;
 pub mod render;
+pub mod resources;
 
 use std::sync::Arc;
 use bevy::prelude::*;
@@ -19,7 +20,7 @@ use gametime::{TimeSpan, TimeStamp};
 use bms_rs::bms::command::JudgeLevel;
 
 use crate::{
-    audio::{AudioLease, AudioManager},
+    audio::AudioManager,
     core::keybind::{KeyBindingsByMode, PlayMode},
     core::settings::SettingsStore,
     core::state::AppState,
@@ -45,7 +46,8 @@ pub struct SkinSyncSet;
 
 impl Plugin for GameplayPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(OnEnter(AppState::Gameplay), setup_gameplay)
+        app.init_resource::<resources::ResourceManager>()
+            .add_systems(OnEnter(AppState::Gameplay), setup_gameplay)
             .add_systems(
                 Update,
                 (
@@ -61,7 +63,7 @@ impl Plugin for GameplayPlugin {
                     .in_set(SkinSyncSet)
                     .run_if(in_state(AppState::Gameplay)),
             )
-            .add_systems(OnExit(AppState::Gameplay), teardown_gameplay);
+            .add_systems(OnExit(AppState::Gameplay), resources::cleanup_gameplay_resources);
     }
 }
 
@@ -79,8 +81,6 @@ self_cell::self_cell! {
 #[derive(Resource)]
 pub struct GameplaySession {
     loaded: LoadedChart,
-    /// 音频租约：占用的音频路径（退出时交还 `AudioManager`）。
-    lease: AudioLease,
     /// 播放头（谱面 + 推进状态自引用绑定，`Drop` 时整体释放，无泄漏）。
     player: ChartPlayback,
     started_at: TimeStamp,
@@ -120,6 +120,7 @@ pub(crate) fn setup_gameplay(
     mut audio: ResMut<AudioManager>,
     settings: Res<SettingsStore>,
     mut images: ResMut<Assets<Image>>,
+    mut resource_manager: ResMut<resources::ResourceManager>,
 ) {
     info!("[gameplay] 加载谱面: {}", selected.title);
     let loaded = match LoadedChart::load(&selected.path) {
@@ -146,11 +147,22 @@ pub(crate) fn setup_gameplay(
     // 之前（优先级加载会跳过流式 BGM 文件）
     audio.register_bgm(loaded.bgm_audio_stats());
     let paths: Vec<_> = loaded.wav_paths.values().cloned().collect();
-    let lease = audio.acquire(&paths);
+    // 音频租约登记到统一资源管理器（退出时统一释放）
+    resource_manager.acquire_audio(audio.acquire(&paths));
+    resource_manager.record_stats(resources::ResourceStats {
+        audio_paths: paths.len(),
+        bga_images: loaded.bga.images.len(),
+        bga_videos: loaded.bga.videos.len(),
+    });
     let priority = loaded.priority_audio_paths(30.0);
     audio.submit_priority(priority.clone());
+    // 预加载时间线：其余音频不一次性全解（内存 = 全谱面采样之和），
+    // 改为按谱面时间滚动窗口（`pump_preload`，每帧推进）。
+    audio.set_song_total_secs(loaded.total_sec);
+    audio.set_preload_timeline(loaded.audio_timeline());
+    audio.pump_preload(0.0);
     info!(
-        "[gameplay] 首批音频 {}/{}（前 30 秒，解码完成即开玩）",
+        "[gameplay] 首批音频 {}/{}（前 30 秒，解码完成即开玩；其余 +/-10s 窗口预加载）",
         priority.len(),
         paths.len()
     );
@@ -195,7 +207,6 @@ pub(crate) fn setup_gameplay(
     let judge_windows = JudgeWindows::for_level(rank);
     commands.insert_resource(GameplaySession {
         loaded,
-        lease,
         player,
         started_at,
         judge_windows,
@@ -276,8 +287,8 @@ fn tick_gameplay(
             info!("[gameplay] 首批音频就绪，开始游玩");
             // 启动谱面时钟（BGM 以音频线程时钟对齐开始），恢复轨道
             audio.begin_song(session.loaded.chart.init_bpm().as_f64());
-            // 剩余音频交后台解码池渐进预加载（避免游玩中主线程现解卡顿）
-            audio.start_low_loading();
+            // 预加载窗口从 0 秒起推进（后续每帧在 tick 尾部按谱面时间 pump）
+            audio.pump_preload(0.0);
             session.started_at = TimeStamp::now();
             session.player = ChartPlayback::new(session.loaded.chart.clone(), |chart| {
                 ChartPlayer::start(
@@ -363,10 +374,19 @@ fn tick_gameplay(
         return;
     }
 
-    // 谱面结束：全部音符已判定，或超时 → 进入完成等待，**等背景音乐自然播完**
-    // 再回选曲（exiting 分支负责轮询），保留结尾演出画面。
+    // 谱面结束：全部音符已消费（命中/POOR/LN 尾部完成 → `consumed`），或超时兜底
+    // → 进入完成等待，**等背景音乐自然播完**再回选曲（exiting 分支负责轮询），
+    // 保留结尾演出画面。
+    //
+    // **不能用 `judged() >= note_count` 判定**：LN 会 record 两次（head 命中 +
+    // 尾部完成），普通音符一次——`judged()` 是纯计数，长音谱面会在"普通全完成
+    // + 约一半 LN 完成"时就 >= 音符总数，导致谱面**提前结束**（画面卡住等音乐）。
+    // 以每个音符实体的 `consumed` 状态为准。
     let elapsed = now.elapsed_since(session.started_at).as_secs_f64();
-    let all_judged = judge_state.judged() >= session.loaded.note_count() as u32;
+    // 音频预加载窗口推进（`elapsed + 10s` 内的音频交后台解码池）：
+    // 内存只与窗口内文件数相关，而非整张谱面的音频总量。
+    audio.pump_preload(elapsed);
+    let all_judged = note_q.iter().all(|nr| nr.consumed);
     if all_judged || elapsed > session.loaded.total_sec + 3.0 {
         info!(
             "[gameplay] 谱面结束（EX {} / Combo {}），等待 BGM 播完…",
@@ -946,27 +966,5 @@ fn update_bga(
     bga.update(now_sec, &asset_server, &mut images);
 }
 
-/// HUD 更新：EX 分数 / 连击 / 判定计数 / Auto 状态。
-// ---------- 清理 ----------
+// ---------- 清理（统一资源释放见 `resources::cleanup_gameplay_resources`） ----------
 
-fn teardown_gameplay(
-    mut commands: Commands,
-    mut audio: ResMut<AudioManager>,
-    session: Res<GameplaySession>,
-    visuals: Query<Entity, With<GameplayVisual>>,
-) {
-    // 停止本谱面仍在播放的音频（BGM/键音），释放音频租约
-    audio.stop_all();
-    audio.release(&session.lease);
-    for e in &visuals {
-        commands.entity(e).despawn();
-    }
-    commands.remove_resource::<GameplaySession>();
-    commands.remove_resource::<GameplayRender>();
-    commands.remove_resource::<GameplayData>();
-    commands.remove_resource::<JudgeState>();
-    commands.remove_resource::<GaugeState>();
-    commands.remove_resource::<LaneStates>();
-    commands.remove_resource::<BgaPlayer>();
-    commands.remove_resource::<GameplayLoadFailed>();
-}

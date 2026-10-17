@@ -19,7 +19,7 @@ const MAX_DECODE_THREADS: usize = 4;
 
 /// 结果通道容量：解码完成的 `StaticSoundData`（可能数十 MB）经有界通道回传，
 /// 主线程消费慢时 worker 阻塞（背压），防止内存无限堆积。
-const RESULT_CHANNEL_CAPACITY: usize = 64;
+pub(crate) const RESULT_CHANNEL_CAPACITY: usize = 64;
 
 /// 后台解码线程池：worker 线程构造 `StaticSoundData`（kira 无后台解码 API，但
 /// `from_file` 是纯 CPU 解码，可在工作线程执行；结果送回主线程缓存）。

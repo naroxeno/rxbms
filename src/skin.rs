@@ -32,7 +32,6 @@ impl Plugin for SkinPlugin {
             runtime::apply_skin_frame
                 .after(crate::gameplay::SkinSyncSet)
                 .run_if(in_state(AppState::Gameplay)),
-        )
-        .add_systems(OnExit(AppState::Gameplay), runtime::hide_skin_slots);
+        );
     }
 }

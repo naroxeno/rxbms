@@ -146,7 +146,12 @@ impl BgaPlayer {
             if let Some(f) = stream.frame_at(now_sec)
                 && let Some(mut img) = images.get_mut(&self.frame_image)
             {
-                img.data = Some(f.rgba);
+                // 复用上一帧的缓冲（1080p RGBA 约 8MB）：直接接管新 Vec 会让
+                // 分配器每帧申请/释放大块内存；这里只做一次同长度拷贝。
+                let mut buf = img.data.take().unwrap_or_default();
+                buf.resize(f.rgba.len(), 0);
+                buf.copy_from_slice(&f.rgba);
+                img.data = Some(buf);
                 // descriptor 仅在尺寸变化时更新（同尺寸每帧改会触发纹理重建 → 卡顿）
                 if self.video_size != Some((f.w, f.h)) {
                     img.texture_descriptor.size = Extent3d {
@@ -225,15 +230,25 @@ struct VideoStream {
     eof: bool,
 }
 
-/// 帧缓冲上限（约半秒超前量；解码再快也只保留最近 16 帧）。
-const VIDEO_BUFFER_MAX: usize = 16;
+/// 帧缓冲上限（主线程侧，约 0.1 秒超前量）。
+///
+/// 旧值是 16：1080p RGBA 单帧约 8MB，16 帧 = 130MB（1440p 超过 200MB），
+/// 会在游玩中吃满内存。视频解码与播放同速推进，4 帧足够平滑播放。
+const VIDEO_BUFFER_MAX: usize = 4;
+
+/// 解码线程 → 主线程的帧通道容量（有界，形成背压）。
+///
+/// 旧实现用无界 `mpsc::channel` + "超前 0.5 秒就 sleep 4ms"节流：主线程掉帧
+/// 时通道里会堆积最多约 0.5 秒的视频帧（1080p ≈ 240MB）。改为有界通道后，
+/// 主线程消费慢 → 解码线程 `send` 阻塞，内存恒定为「通道 + 帧缓冲」个帧。
+const VIDEO_CHANNEL_CAPACITY: usize = 4;
 
 impl VideoStream {
     /// 打开视频并启动后台解码线程。
     ///
     /// `trigger_sec`：该视频首次触发的谱面时间（beatoraja `restart()` 校准基准）。
     fn start(path: &Path, trigger_sec: f64) -> Result<Self, String> {
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = mpsc::sync_channel(VIDEO_CHANNEL_CAPACITY);
         let stop = Arc::new(AtomicBool::new(false));
         let stop2 = stop.clone();
         let target_ns = Arc::new(AtomicU64::new((trigger_sec * 1e9) as u64));

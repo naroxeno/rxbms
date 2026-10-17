@@ -631,24 +631,6 @@ fn spawn_fallback(world: &mut World, msg: &str) {
     ));
 }
 
-/// 退出游玩：隐藏全部皮肤槽（避免残留到其他界面）。
-pub fn hide_skin_slots(
-    mut runtime: Option<NonSendMut<SkinRuntime>>,
-    mut q: Query<&mut Visibility>,
-) {
-    let Some(runtime) = runtime.as_deref_mut() else { return };
-    for &e in &runtime.slots {
-        if let Ok(mut v) = q.get_mut(e) {
-            *v = Visibility::Hidden;
-        }
-    }
-    for &e in &runtime.text_slots {
-        if let Ok(mut v) = q.get_mut(e) {
-            *v = Visibility::Hidden;
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
