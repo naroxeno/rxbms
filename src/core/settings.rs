@@ -375,7 +375,7 @@ mod tests {
 
     #[test]
     fn setting_value_keycode_roundtrip() {
-        // 覆盖非候选键（此前 parse_keycode 只识别少量键，会丢失绑定）
+        // 覆盖非候选键
         for code in [
             KeyCode::F1,
             KeyCode::Digit7,

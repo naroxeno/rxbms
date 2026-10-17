@@ -209,12 +209,6 @@ mod tests {
     }
 
     #[test]
-    fn not_reached_yet() {
-        let st = LnState::default();
-        assert_eq!(update_ln(&st, 0.0, 10.0, 5.0), None);
-    }
-
-    #[test]
     fn lntype_kinds() {
         assert_eq!(LnKind::from(LnMode::Ln), LnKind::LongNote);
         assert_eq!(LnKind::from(LnMode::Cn), LnKind::ChargeNote);

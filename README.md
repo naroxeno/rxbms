@@ -1,6 +1,6 @@
 # rxbms
 
-基于 **Bevy 0.19** 的 BMS 铺面播放器（BMS = 节奏游戏音乐数据格式，源自 BM98/beatoraja 生态）。
+基于 **Bevy 0.20** 的 BMS 铺面播放器（BMS = 节奏游戏音乐数据格式，源自 BM98/beatoraja 生态）。
 
 > ⚠️ **极早期开发阶段**：本项目仍处于高度开发中，功能可能随时变化或损坏，
 > 请勿作为日常工具依赖。欢迎在开发过程中共同完善。
@@ -48,7 +48,7 @@ cargo run --release
 ## 测试
 
 ```bash
-cargo test          # 94 测试（判定/音频缓存/皮肤求值/BMS 解析/扫描增量等）
+cargo test          # 90 测试（判定/音频缓存/皮肤求值/BMS 解析/扫描增量等）
 cargo clippy        # 保持零警告（除既有 manifest key ×2）
 ```
 
@@ -86,7 +86,7 @@ src/
 
 ## 技术栈
 
-- Bevy 0.19（ECU/渲染/UI）
+- Bevy 0.20（ECS/渲染/UI，shader 用 WESL）
 - bms-rs（BMS 解析，git fork：`https://github.com/naroxeno/bms-rs.git`，分支 `fix-stop-duration-ms`）
 - kira 0.12 + cpal（音频输出）+ Symphonia（解码）
 - ffmpeg-next（BGA 视频）

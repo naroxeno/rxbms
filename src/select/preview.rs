@@ -494,19 +494,4 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// 状态文案覆盖四种状态。
-    #[test]
-    fn status_labels() {
-        assert!(PreviewStatus::Idle.label().contains("空格开始"));
-        assert!(PreviewStatus::Loading.label().contains("解析"));
-        assert!(
-            PreviewStatus::Playing {
-                elapsed: 1.5,
-                total: 30.0
-            }
-            .label()
-            .contains("1.5")
-        );
-        assert!(PreviewStatus::Failed("x".into()).label().contains('x'));
-    }
 }

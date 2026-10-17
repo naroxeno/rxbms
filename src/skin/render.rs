@@ -1036,9 +1036,7 @@ mod tests {
 
     #[test]
     fn number_block_left_edge_is_destination_x() {
-        // beatoraja SkinNumber：数字块左边界 = destination.x（region.x），align 只影响
-        // 块内前导排布。此前 align=0 被实现成"右对齐向左延伸"，导致数字块左移
-        // 半个块宽、被旁边图标盖住。验证首位数字 x = destination 末帧 x。
+        // beatoraja SkinNumber：数字块左边界 = destination.x，align 只影响块内排布。
         let (_skin, desc, cfg, state) = load();
         *state.write().unwrap() = sample_state();
         let cmds = evaluate_frame(&desc, &cfg, &state, &Default::default());
@@ -1130,8 +1128,7 @@ mod tests {
 
     #[test]
     fn number_digits_ordered_left_to_right() {
-        // gauge-num（ref=107，值 75）→ 2 位 "75"：十位（7）在最左、个位（5）在最右。
-        // 此前 digits 索引反了（个位画在最左），数字显示成倒序。
+        // gauge-num（ref=107，值 75）→ "75"：十位在最左、个位在最右。
         let (_skin, desc, cfg, state) = load();
         *state.write().unwrap() = sample_state();
         let cmds = evaluate_frame(&desc, &cfg, &state, &Default::default());

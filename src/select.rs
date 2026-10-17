@@ -15,7 +15,12 @@ mod preview;
 
 use std::path::PathBuf;
 
-use bevy::{input::mouse::MouseWheel, prelude::*, ui::Overflow};
+use bevy::{
+    input::mouse::MouseWheel,
+    prelude::*,
+    ui::Overflow,
+    ui_widgets::{Activate, Button},
+};
 
 use crate::{
     audio::AudioManager,
@@ -73,6 +78,7 @@ impl Plugin for SongSelectPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<SelectState>()
             .init_resource::<SongPreview>()
+            .add_observer(on_row_activate)
             .add_systems(OnEnter(AppState::SongSelect), enter_song_select)
             .add_systems(
                 Update,
@@ -81,7 +87,6 @@ impl Plugin for SongSelectPlugin {
                     track_viewport,
                     select_input,
                     select_wheel,
-                    row_click,
                     preview::preview_tick,
                     rebuild_rows,
                     update_details,
@@ -459,7 +464,7 @@ fn select_input(
         scanner.request_scan_all();
     }
     if keys.just_pressed(KeyCode::F1) {
-        NextState::set_if_neq(&mut next, AppState::Settings);
+        NextState::set_if_different(&mut next, AppState::Settings);
         return;
     }
     if state.songs.is_empty() {
@@ -517,24 +522,19 @@ fn select_wheel(mut wheel: MessageReader<MouseWheel>, mut state: ResMut<SelectSt
 }
 
 /// 鼠标：单击选中，点击已选中行则进入游玩。
-#[allow(clippy::type_complexity)]
-fn row_click(
+fn on_row_activate(
+    activate: On<Activate>,
+    rows: Query<&SongRow>,
     mut state: ResMut<SelectState>,
     mut commands: Commands,
     mut next: ResMut<NextState<AppState>>,
     mut audio: ResMut<AudioManager>,
     mut preview: ResMut<SongPreview>,
-    rows: Query<(&Interaction, &SongRow), (Changed<Interaction>, With<Button>)>,
 ) {
-    let mut clicked = None;
-    for (interaction, row) in &rows {
-        if *interaction == Interaction::Pressed {
-            clicked = Some(row.index);
-        }
-    }
-    let Some(index) = clicked else {
+    let Ok(row) = rows.get(activate.entity) else {
         return;
     };
+    let index = row.index;
     if index == state.selected {
         launch(&mut commands, &mut next, &mut audio, &mut preview, &state);
         return;
@@ -567,7 +567,7 @@ fn launch(
         path: meta.path.clone(),
         title,
     });
-    NextState::set_if_neq(next, AppState::Gameplay);
+    NextState::set_if_different(next, AppState::Gameplay);
 }
 
 /// 重建可视行（虚拟化）：只渲染视口内的十几行。

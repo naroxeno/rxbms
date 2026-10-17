@@ -114,6 +114,6 @@ fn debug_state_switch(
         None
     };
     if let Some(target) = target {
-        NextState::set_if_neq(&mut next, target);
+        NextState::set_if_different(&mut next, target);
     }
 }

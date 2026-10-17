@@ -17,7 +17,7 @@ use bevy::{
 };
 
 /// shader 路径（`assets/shaders/skin_fx.wgsl`）。
-pub const SKIN_FX_SHADER_PATH: &str = "shaders/skin_fx.wgsl";
+pub const SKIN_FX_SHADER_PATH: &str = "shaders/skin_fx.wesl";
 
 /// 特效标志：black-key 抠黑。
 pub const FLAG_BLACK_KEY: u32 = 1 << 0;

@@ -1,14 +1,10 @@
-// 皮肤特效材质片段着色器（bevy Material2d）
+// 皮肤特效材质片段着色器（bevy Material2d，WESL）
 // 移植 beatoraja 的 ffmpeg.frag（通道重排）与 layer.frag（黑色抠像）。
 
-#import bevy_sprite::{
-    mesh2d_vertex_output::VertexOutput,
-    mesh2d_view_bindings::view,
-}
+import bevy_sprite_render::mesh2d::vertex_output::VertexOutput;
 
-#ifdef SRGB_OUTPUT
-#import bevy_render::color_operations::linear_to_srgb
-#endif
+@if(SRGB_OUTPUT)
+import bevy_render::color_operations::linear_to_srgb;
 
 struct SkinFxMaterial {
     flags: u32,
@@ -22,14 +18,12 @@ const FLAG_BLACK_KEY: u32 = 1u;
 const FLAG_SWAP_RGB: u32 = 2u;
 const FLAG_LUMA_KEY: u32 = 4u;
 
-@group(#{MATERIAL_BIND_GROUP}) @binding(0) var<uniform> material: SkinFxMaterial;
-@group(#{MATERIAL_BIND_GROUP}) @binding(1) var texture: texture_2d<f32>;
-@group(#{MATERIAL_BIND_GROUP}) @binding(2) var texture_sampler: sampler;
+@group(constants::MATERIAL_BIND_GROUP) @binding(0) var<uniform> material: SkinFxMaterial;
+@group(constants::MATERIAL_BIND_GROUP) @binding(1) var texture: texture_2d<f32>;
+@group(constants::MATERIAL_BIND_GROUP) @binding(2) var texture_sampler: sampler;
 
 @fragment
-fn fragment(
-    mesh: VertexOutput,
-) -> @location(0) vec4<f32> {
+fn fragment(mesh: VertexOutput) -> @location(0) vec4<f32> {
     let uv = mix(material.uv_rect.xy, material.uv_rect.zw, mesh.uv);
     var c = textureSample(texture, texture_sampler, uv);
 
@@ -37,7 +31,7 @@ fn fragment(
     if ((material.flags & FLAG_SWAP_RGB) != 0u) {
         c = vec4(c.b, c.g, c.r, c.a);
     }
-    // layer shader：纯黑像素透明（黑底特效图抠像，beatoraja `if(r==0&&g==0&&b==0)`）
+    // layer shader：纯黑像素透明（黑底特效图抠像）
     if ((material.flags & FLAG_BLACK_KEY) != 0u && c.r == 0.0 && c.g == 0.0 && c.b == 0.0) {
         c.a = 0.0;
     }
@@ -46,8 +40,7 @@ fn fragment(
         let luma = max(c.r, max(c.g, c.b));
         c.a = min(c.a, luma);
     }
-#ifdef SRGB_OUTPUT
+    @if(SRGB_OUTPUT)
     c = vec4(linear_to_srgb(c.rgb), c.a);
-#endif
     return c;
 }

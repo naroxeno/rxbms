@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use bevy::{
     input::keyboard::KeyboardInput,
     prelude::*,
+    ui_widgets::{Activate, Button},
 };
 
 use crate::{
@@ -28,6 +29,7 @@ pub struct SettingsPlugin;
 impl Plugin for SettingsPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<SettingsUiState>()
+            .add_observer(on_settings_button)
             .add_systems(OnEnter(AppState::Settings), settings_ui_setup)
             .add_systems(OnExit(AppState::Settings), settings_ui_teardown)
             .add_systems(
@@ -342,7 +344,75 @@ fn persist_settings(
     }
 }
 
-/// 处理按钮点击、键位重绑捕获与输入框键盘事件。
+/// 设置界面按钮点击（`ui_widgets::Button` 的 `Activate` 事件）。
+#[allow(clippy::too_many_arguments)]
+fn on_settings_button(
+    activate: On<Activate>,
+    buttons: Query<&SettingsAction>,
+    db: Res<SongsDb>,
+    scanner: Option<Res<SongScanner>>,
+    mut bindings: ResMut<KeyBindingsByMode>,
+    registry: Res<SettingsRegistry>,
+    mut store: ResMut<SettingsStore>,
+    mut state: ResMut<SettingsUiState>,
+    mut next: ResMut<NextState<AppState>>,
+) {
+    let Ok(action) = buttons.get(activate.entity) else {
+        return;
+    };
+    match action {
+        SettingsAction::FocusInput => {
+            state.input_active = !state.input_active;
+        }
+        SettingsAction::AddFolder => {
+            add_folder_from_input(&db, &mut state, scanner.as_deref());
+        }
+        SettingsAction::RemoveFolder { path } => {
+            match db.remove_folder(path) {
+                Ok(()) => {
+                    // remove_folder 会连同该目录下的曲目记录一起删除，无需再扫描
+                    state.status = Some(format!("已移除: {}", path.display()));
+                }
+                Err(e) => state.status = Some(format!("移除失败: {e}")),
+            }
+            state.rendered_folders.clear();
+        }
+        SettingsAction::Rescan => run_scan(&db, &mut state, scanner.as_deref()),
+        SettingsAction::BackToSelect => {
+            NextState::set_if_different(&mut next, AppState::SongSelect);
+        }
+        // 设置项调整
+        SettingsAction::SettingDec { id } => {
+            adjust_number(&registry, &mut store, id, false);
+            state.rendered_settings.clear();
+            persist_settings(&store, &mut bindings, &mut state);
+        }
+        SettingsAction::SettingInc { id } => {
+            adjust_number(&registry, &mut store, id, true);
+            state.rendered_settings.clear();
+            persist_settings(&store, &mut bindings, &mut state);
+        }
+        SettingsAction::SettingToggle { id } => {
+            let cur = store.get_bool(id, false);
+            store.set(id, SettingValue::Bool(!cur));
+            state.rendered_settings.clear();
+            persist_settings(&store, &mut bindings, &mut state);
+        }
+        SettingsAction::SettingCycle { id } => {
+            cycle_enum(&registry, &mut store, id);
+            state.rendered_settings.clear();
+            persist_settings(&store, &mut bindings, &mut state);
+        }
+        SettingsAction::SettingRebind { id } => {
+            state.input_active = false;
+            state.rebind = Some(*id);
+            let name = registry.get(id).map_or(*id, |d| d.name);
+            state.status = Some(format!("按下新键以绑定 {name}…"));
+        }
+    }
+}
+
+/// 键位重绑捕获与输入框键盘事件。
 #[allow(clippy::too_many_arguments)] // Bevy 系统参数
 #[allow(clippy::type_complexity)] // Bevy 系统 Query 参数
 fn settings_actions(
@@ -355,7 +425,6 @@ fn settings_actions(
     mut next: ResMut<NextState<AppState>>,
     keys: Res<ButtonInput<KeyCode>>,
     mut kb: MessageReader<KeyboardInput>,
-    buttons: Query<(&Interaction, &SettingsAction), (Changed<Interaction>, With<Button>)>,
 ) {
     // 1. 键位重绑捕获：优先于输入框
     if let Some(id) = state.rebind {
@@ -404,63 +473,6 @@ fn settings_actions(
                 if let Some(text) = &event.text {
                     state.input.push_str(text);
                 }
-            }
-        }
-    }
-
-    // 2. 按钮点击
-    for (interaction, action) in &buttons {
-        if *interaction != Interaction::Pressed {
-            continue;
-        }
-        match action {
-            SettingsAction::FocusInput => {
-                state.input_active = !state.input_active;
-            }
-            SettingsAction::AddFolder => {
-                add_folder_from_input(&db, &mut state, scanner.as_deref());
-            }
-            SettingsAction::RemoveFolder { path } => {
-                match db.remove_folder(path) {
-                    Ok(()) => {
-                        // remove_folder 会连同该目录下的曲目记录一起删除，无需再扫描
-                        state.status = Some(format!("已移除: {}", path.display()));
-                    }
-                    Err(e) => state.status = Some(format!("移除失败: {e}")),
-                }
-                state.rendered_folders.clear();
-            }
-            SettingsAction::Rescan => run_scan(&db, &mut state, scanner.as_deref()),
-            SettingsAction::BackToSelect => {
-                NextState::set_if_neq(&mut next, AppState::SongSelect);
-            }
-            // 设置项调整
-            SettingsAction::SettingDec { id } => {
-                adjust_number(&registry, &mut store, id, false);
-                state.rendered_settings.clear();
-                persist_settings(&store, &mut bindings, &mut state);
-            }
-            SettingsAction::SettingInc { id } => {
-                adjust_number(&registry, &mut store, id, true);
-                state.rendered_settings.clear();
-                persist_settings(&store, &mut bindings, &mut state);
-            }
-            SettingsAction::SettingToggle { id } => {
-                let cur = store.get_bool(id, false);
-                store.set(id, SettingValue::Bool(!cur));
-                state.rendered_settings.clear();
-                persist_settings(&store, &mut bindings, &mut state);
-            }
-            SettingsAction::SettingCycle { id } => {
-                cycle_enum(&registry, &mut store, id);
-                state.rendered_settings.clear();
-                persist_settings(&store, &mut bindings, &mut state);
-            }
-            SettingsAction::SettingRebind { id } => {
-                state.input_active = false;
-                state.rebind = Some(*id);
-                let name = registry.get(id).map_or(*id, |d| d.name);
-                state.status = Some(format!("按下新键以绑定 {name}…"));
             }
         }
     }

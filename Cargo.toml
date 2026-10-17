@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-bevy = { version = "0.19.0", features = ["serialize"] }
+bevy = { version = "0.20.0", features = ["serialize"] }
 # BMS 解析：指向 fork 分支（含 y=0 首帧事件、STOP 时长修复），
 # 不再用本地 path 依赖——`.fork/` 不入库，path 依赖会让仓库无法构建
 bms-rs = { git = "https://github.com/naroxeno/bms-rs.git", branch = "fix-stop-duration-ms" }

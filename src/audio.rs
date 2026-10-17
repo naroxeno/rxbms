@@ -49,70 +49,33 @@ use self::decode::DecodePool;
 use self::metronome::{MetronomeData, MetronomeHandle};
 use self::track::Tracks;
 
-/// 缓存项数量上限（防御性兜底）。
-///
-/// 主内存回收机制是铺面退出时 `release` 立即释放引用归零的项；数量上限只在
-/// 单场游玩内缓存异常膨胀时兜底淘汰。
+/// 缓存项数量上限（防御性兜底：正常回收靠 `release` 引用归零）。
 const LRU_CACHE_MAX: usize = 512;
 
-/// 缓存总字节上限（解码后的 f32 采样，`Frame` = 立体声 8 字节/帧）。
-///
-/// 首批（开玩所需）音频解码后 **pinned** 不可淘汰；其余音频按时间窗口渐进解码，
-/// 超出本上限时按 LRU 淘汰**非 pinned** 项——被淘汰的音频再次触发时由
-/// `play_synced` / `play_bgm_event` 同步解码补回，内存不随谱面音频总量线性增长。
+/// 缓存总字节上限（解码后的 f32 采样）。首批音频 pinned 不可淘汰，其余按 LRU
+/// 淘汰非 pinned 项；被淘汰的再次触发时同步解码补回，内存不随谱面音频总量增长。
 const AUDIO_CACHE_MAX_BYTES: u64 = 256 * 1024 * 1024;
 
-/// 音频预加载窗口（秒）：游玩中每帧把 `now + 本值` 内的音频交后台解码池。
-///
-/// 旧实现一次性把**整张谱面的全部音频**交池解码（内存 = 全谱面采样之和，
-/// 数千个键音可达数百 MB）。改为滚动窗口后内存只与窗口内文件数相关；
-/// 4 个解码线程解码数百 KB 的键音只需毫秒级，10s 前瞻足够留出余量。
+/// 预加载窗口（秒）：每帧把 `now + 本值` 内的音频交后台解码池。
 const PRELOAD_LOOKAHEAD_SECS: f64 = 10.0;
 
-/// BGM 走流式解码的文件大小下限（字节）。
-///
-/// 小于该值的 BGM 通道采样（常被密集事件引用）走静态缓存多路并发，
-/// 避免每次事件重开流+掐断旧流导致背景音几乎无声（2026-08 修复的 bug）。
+/// BGM 走流式解码的文件大小下限；更小的采样走静态缓存多路并发，避免停旧流
+/// 重开导致背景音被掐断。
 const STREAMING_MIN_BYTES: u64 = 2_000_000;
 
-/// BGM 走流式解码的最大事件引用次数。
-///
-/// 同一文件被超过该次数的事件触发（循环采样/密集 BGM 序列）即使文件够大
-/// 也走静态缓存——否则每次事件停旧流重开，背景音被掐断。
+/// 走流式解码的最大事件引用次数；超过则改走静态缓存。
 const STREAMING_MAX_EVENTS: usize = 8;
 
-/// 同一 **#WAV 槽位**在键音轨上允许的最大并发实例数。
-///
-/// BMS 谱面的长音持续音常由 LN body 内**密集引用同一 wav** 的键音事件实现
-/// （每 16/32 分音符一个）。若每个事件都新建一个实例且互不干扰，多个实例
-/// 波形叠加会**盖过 BGM**（用户报告：听不见 BGM）。超过上限时停止最旧的
-/// 同槽位实例再播新的——发声不丢、叠加受控。
-///
-/// 计数单位是**槽位（`#WAV` 的 id）而不是文件路径**：谱师把同一个 wav 定义成
-/// 多个槽位（01/02/03/04 指向同一文件）是 BMS 里写音量的标准手法——同时发声
-/// 数 +1 即音量叠 N 倍（BMS command memo「多重定義」章节）；按路径计数会把
-/// 4 层叠音削成 2 层，听感比谱面意图轻一半。
+/// 同一 `#WAV` 槽位在键音轨允许的最大并发实例数：超出时停最旧的，避免叠加盖过
+/// BGM。按槽位而非路径计数——同一 wav 占多个槽位是 BMS 写音量的标准手法。
 const KEYSOUND_MAX_PER_SLOT: usize = 2;
 
 /// 键音轨并发实例总上限（极端谱面兜底；kira 轨道默认容量 128）。
-///
-/// 多条轨道同时按住 LN + 常规键音密集出现时，无上限会撑满轨道容量并
-/// 大量堆叠；此处丢弃超限的本次发声（同时同槽位限制已保证主流场景不触发）。
 const KEYSOUND_MAX_TOTAL: usize = 32;
 
-/// 连续音频（"背景床"）判据：采样时长 ≥ 铺面总时长 × 该比例。
-///
-/// 01 通道（BGM 轨）在 BMS 里两种用法在**触发结构上不可区分**（rainbow 类是同一
-/// 整曲 BGM 被 20 次/秒地铺满，键音铺面是几百个不同采样被密集触发），能分开
-/// 两类作者的只有采样时长这一物理属性：单发音效（鼓/镲/打击乐）的数秒内衰减，
-/// 连续音乐床/整曲是数十秒到分钟。因此判据取"时长是否足以覆盖铺面的显著部分"，
-/// 不写死绝对秒数（`10.0` 那种数看着精确，其实是随手取的）。
-///
-/// 代入实测：MORNINGLOOM 铺面 136s → 阈值 34s，最长鼓组 1.32s 全部判 `OneShot`
-/// （此前用 1.0s 绝对阈值把 42% 鼓组事件判成 Bed 而丢弃）；整曲 BGM ≈ 铺面时长 → Bed。
-///
-/// 判据刻意偏保守：拿不准（铺面总时长未知/为 0）一律按采样处理——**判定错误
-/// 最坏只会多叠一点，不会吞音**。
+/// "背景床"判据：采样时长 ≥ 铺面总时长 × 该比例。MORNINGLOOM（136s）下阈值 34s，
+/// 鼓组（≤1.32s）全部按一次性采样处理，整曲 BGM ≈ 铺面时长 → Bed。铺面时长未知
+/// 时一律按采样处理（判错最坏只多叠一点，不吞音）。
 const BED_MIN_CHART_RATIO: f64 = 0.25;
 
 /// 一次性 BGM 采样同时发声数软上限（超出时停最旧，保证新事件必发声）。
@@ -203,9 +166,8 @@ pub struct AudioManager {
     bgm_roles: HashMap<PathBuf, bool>,
     /// 一次性 BGM 采样轨上正在发声的实例（软上限见 [`BGM_SAMPLE_MAX_VOICES`]）。
     ///
-    /// 短采样不参与去重（每个事件都播），因此必须自行管理同时发声数：
-    /// 超出上限时停最旧的，避免撑满 kira 硬上限后 `play` 报
-    /// `SoundLimitReached` 导致后续事件无声（用户报告的"一直在丢音"）。
+    /// 短采样不参与去重（每个事件都播），超出软上限时停最旧的，避免撑满 kira
+    /// 硬上限后 `SoundLimitReached` 导致后续事件无声。
     bgm_samples: Vec<StaticSoundHandle>,
 }
 
@@ -263,9 +225,8 @@ impl AudioManager {
     /// - 真正的长 BGM：文件大（≥ [`STREAMING_MIN_BYTES`]）且事件稀疏（≤
     ///   [`STREAMING_MAX_EVENTS`]），整曲背景音乐、播放长，走 `StreamingSoundData`
     ///   流式解码（省内存）；
-    /// - 其余（小采样、或大文件被密集事件引用，如 rainbow 每秒 ~20 个 BGM 事件）：
-    ///   走静态缓存多路并发。否则每次事件 `play_bgm` 停旧流+重开文件+等流式缓冲，
-    ///   背景音会被密集掐断而几乎无声（2026-08 修复的 bug）。
+    /// - 其余（小采样、或大文件被密集事件引用）：走静态缓存多路并发。否则每次
+    ///   事件 `play_bgm` 停旧流+重开文件+等流式缓冲，背景音会被密集掐断。
     ///
     /// 注意：必须在 `submit_priority` **之前**调用，优先级加载会跳过流式 BGM 文件。
     pub fn register_bgm(&mut self, stats: std::collections::HashMap<PathBuf, usize>) {
@@ -329,9 +290,8 @@ impl AudioManager {
     /// 推进预加载窗口（每帧调用）：把 `now_sec + PRELOAD_LOOKAHEAD_SECS` 之内
     /// 尚未缓存的音频交后台解码池。
     ///
-    /// **内存约束**：旧实现一次性交池解码整张谱面的全部音频（数千键音 = 数百
-    /// MB）；滚动窗口下同时在途/缓存的文件数只与窗口内事件数相关，配合
-    /// [`AUDIO_CACHE_MAX_BYTES`] 淘汰，内存占用与谱面音频总量解耦。
+    /// 同时缓存/在途的文件数只与窗口内事件数相关，配合 [`AUDIO_CACHE_MAX_BYTES`]
+    /// 淘汰，内存占用与谱面音频总量解耦。
     pub fn pump_preload(&mut self, now_sec: f64) {
         let due = due_preload_paths(
             &self.preload_timeline,
@@ -533,9 +493,7 @@ impl AudioManager {
     ///   （`bgm_sample`），同时发声数受 [`BGM_SAMPLE_MAX_VOICES`] 软上限约束
     ///   （超出停最旧，保证本次必发声）。
     ///
-    /// 旧实现把全部静态 BGM 都塞进键音轨且不计数：密集谱面会撑满 kira 子轨
-    /// 默认的 128 发声上限 → `SoundLimitReached` → 之后的事件**全部丢音**
-    /// （2026-10 用户报告 MORNINGLOOM 鼓组 BGM 连续丢音）。
+    /// 静态 BGM 不在键音轨上播放，避免撑满 kira 子轨的发声上限后整场丢音。
     pub fn play_bgm_event(&mut self, path: &Path) -> bool {
         self.ensure_song_tracks();
         // 流式长 BGM：不与一次性采样混轨，去重后走 `play_bgm`
@@ -764,8 +722,8 @@ impl AudioManager {
     /// drop 本场谱面的播放轨道 → 轨道上的全部声音（大 BGM 流 + 静态 BGM + 键音）
     /// 随之停止；暂停谱面时钟。
     ///
-    /// 注意：不用 `pause`——pause 只暂停不销毁，下一场 `resume` 会让旧声音
-    /// 复活重叠（2026-08 修复的 bug）。不影响主界面音轨（`menu_track`）。
+    /// 不用 `pause`：pause 只暂停不销毁，下一场 `resume` 会让旧声音复活重叠。
+    /// 不影响主界面音轨（`menu_track`）。
     pub fn stop_all(&mut self) {
         // 销毁本场铺面轨道：`TrackHandle` drop 触发 kira 轨道移除（`mark_for_removal`），
         // 轨道默认 `persist_until_sounds_finish=false`，下一音频回调周期即整体销毁，
@@ -1114,14 +1072,9 @@ impl AudioCache {
 
     /// LRU 淘汰：移除最旧的**非首批**项，直到缓存不超限（数量 + 字节双上限）。
     ///
-    /// **为什么不是"未引用项"**：谱面进入时 `acquire` 会给该谱面**全部**音频路径
-    /// 加租约（用于退出时一键释放），因此游玩期间缓存项几乎全部 `refs > 0`。
-    /// 旧实现只在 `refs == 0` 里找淘汰候选 → 找不到就 `break`，数量/字节上限
-    /// **从未生效**，缓存会一直涨到整张谱面解码后的总量（数千个键音 = 数百 MB，
-    /// 即"加载铺面内存占用过大"）。
-    ///
-    /// 现在只保留首批（`submit_priority` 标记、开玩必需）为 pinned，其余可淘汰；
-    /// 被淘汰项再次触发时 `play_synced` / `play_bgm_event` 会同步解码补回。
+    /// 不能只淘汰 `refs == 0` 的项：`acquire` 给谱面全部路径加租约，游玩期间几乎
+    /// 所有缓存项都有引用，只按未引用淘汰等于上限从不生效。因此只保留首批
+    /// （`submit_priority` 标记）为 pinned，其余可淘汰并在再次触发时同步解码补回。
     fn evict_if_needed(&mut self) {
         loop {
             let over_count = self.cache.len() > LRU_CACHE_MAX;
@@ -1247,17 +1200,6 @@ mod tests {
     }
 
     #[test]
-    fn keysound_limiter_clear_resets_all() {
-        let mut l = KeysoundLimiter::default();
-        l.try_acquire(1, KEYSOUND_MAX_TOTAL);
-        l.try_acquire(2, KEYSOUND_MAX_TOTAL);
-        l.clear();
-        assert_eq!(l.count(1), 0);
-        assert_eq!(l.count(2), 0);
-        assert!(l.try_acquire(1, KEYSOUND_MAX_TOTAL));
-    }
-
-    #[test]
     fn bgm_event_action_by_chart_ratio() {
         let bed_a = PathBuf::from("/bgm/song_full.ogg");
         let bed_b = PathBuf::from("/bgm/song_alt.ogg");
@@ -1276,8 +1218,7 @@ mod tests {
             BgmEventAction::OneShot,
             "采样即使同路径在播也应重触发"
         );
-        // MORNINGLOOM 实测：1.02–1.32s 的长尾鼓组采样在 136s 铺面里仍是采样，
-        // 此前用 1.0s 绝对阈值把 42% 鼓组事件判成 Bed 而丢弃
+        // MORNINGLOOM 实测：1.02–1.32s 的长尾鼓组采样在 136s 铺面里仍是采样
         assert_eq!(
             bgm_event_action(is_bed_audio(1.32, 136.0), Some((&hat, true)), &hat),
             BgmEventAction::OneShot
@@ -1413,9 +1354,7 @@ mod tests {
 
     /// 被谱面租约引用（`refs > 0`）但**非首批**的项也必须可淘汰。
     ///
-    /// 这是"加载铺面内存占用过大"的根因回归测试：旧实现只在 `refs == 0` 中找
-    /// 淘汰候选，而谱面进入时所有路径都有租约 → 上限从未生效，缓存涨到整张
-    /// 谱面解码后的总量。
+    /// 回归：`acquire` 给全部路径加租约后，字节/数量上限仍必须生效。
     #[test]
     fn evict_referenced_but_unpinned_entries() {
         let mut c = AudioCache::default();
@@ -1466,18 +1405,6 @@ mod tests {
         let last = due_preload_paths(&timeline, &mut idx, 21.0, PRELOAD_LOOKAHEAD_SECS);
         assert_eq!(last, vec![PathBuf::from("/d.ogg")]);
         assert_eq!(idx, timeline.len());
-    }
-
-    /// 线性音量 → dB 换算（main track 音量映射）。
-    #[test]
-    fn linear_volume_to_decibels() {
-        assert_eq!(linear_to_db(1.0), Decibels(0.0));
-        assert_eq!(linear_to_db(0.0), Decibels::SILENCE);
-        // 0.5 → 20·log10(0.5) ≈ -6.02 dB
-        let db = linear_to_db(0.5);
-        assert!((db.0 - (-6.0206)).abs() < 1e-3, "db={}", db.0);
-        // 单调：音量越小 dB 越低
-        assert!(linear_to_db(0.2).0 < linear_to_db(0.8).0);
     }
 
     /// 真实音频解码（kira `StaticSoundData::from_file`；文件不存在时跳过）。

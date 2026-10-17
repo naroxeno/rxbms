@@ -1,9 +1,14 @@
 # rxbms TODO
 
-Bevy 0.19 BMS 铺面播放器 — 未完成事项清单。
-基线：94 测试全绿（+2 个 `#[ignore]` 手动基准，2026-10）。
+Bevy 0.20 BMS 铺面播放器 — 未完成事项清单。
+基线：90 测试全绿（+2 个 `#[ignore]` 手动基准，2026-10）。
 
 ## 最近完成（2026-08-14 ~ 2026-10-17）
+
+- **升级 Bevy 0.20 + shader 改 WESL**：`bevy = "0.20"`（wgpu 30 / wesl-rs 解析）；
+  `NextState::set_if_neq` → `set_if_different`；`ui::widgets::Button` + `Interaction`
+  已废弃，改为 `ui_widgets::Button` + `Activate` 观察者（选曲行 / 设置按钮）；
+  `assets/shaders/skin_fx.wgsl` → `skin_fx.wesl`（`import`、`@if`、`constants::MATERIAL_BIND_GROUP`）
 
 - **选曲界面 + 自动音频预览（`src/select.rs` 重写、新增 `src/select/preview.rs`）**：
   - 布局：头部（标题 / 总数或扫描进度）+ 左侧铺面列表卡片 + 右侧详情面板 + 底部提示

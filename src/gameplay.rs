@@ -243,7 +243,7 @@ fn tick_gameplay(
     // 加载失败 → 回选曲
     if load_failed.is_some() {
         error!("[gameplay] 谱面加载失败，返回选曲");
-        NextState::set_if_neq(&mut next, AppState::SongSelect);
+        NextState::set_if_different(&mut next, AppState::SongSelect);
         return;
     }
 
@@ -258,7 +258,7 @@ fn tick_gameplay(
             > EXIT_TIMEOUT_SECS;
         if (!audio.is_playing() && !bga.is_playing()) || timeout {
             audio.stop_all(); // 兜底清理
-            NextState::set_if_neq(&mut next, AppState::SongSelect);
+            NextState::set_if_different(&mut next, AppState::SongSelect);
         }
         return; // 等待期间不推进播放头、不判定
     }
@@ -268,10 +268,10 @@ fn tick_gameplay(
     if keys.just_pressed(KeyCode::Escape) {
         info!("[gameplay] 手动退出（EX {} / Combo {}）", judge_state.ex_score, judge_state.combo);
         if session.loading {
-            NextState::set_if_neq(&mut next, AppState::SongSelect);
+            NextState::set_if_different(&mut next, AppState::SongSelect);
         } else {
             audio.stop_all(); // 直接释放 BGM/键音/时钟，不等播完
-            NextState::set_if_neq(&mut next, AppState::SongSelect);
+            NextState::set_if_different(&mut next, AppState::SongSelect);
         }
         return;
     }
@@ -370,7 +370,7 @@ fn tick_gameplay(
     if gauge.failed {
         info!("[gameplay] 血量归零（GAUGE FAILED）");
         audio.stop_all();
-        NextState::set_if_neq(&mut next, AppState::SongSelect);
+        NextState::set_if_different(&mut next, AppState::SongSelect);
         return;
     }
 
