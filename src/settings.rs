@@ -422,7 +422,6 @@ fn settings_actions(
     registry: Res<SettingsRegistry>,
     mut store: ResMut<SettingsStore>,
     mut state: ResMut<SettingsUiState>,
-    mut next: ResMut<NextState<AppState>>,
     keys: Res<ButtonInput<KeyCode>>,
     mut kb: MessageReader<KeyboardInput>,
 ) {

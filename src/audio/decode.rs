@@ -106,6 +106,18 @@ impl DecodePool {
         drop(q);
         self.condvar.notify_one();
     }
+
+    /// 提交一个**插队**解码任务：长音频要在首次触发前解码完，不能排在几百个
+    /// 短采样之后（排队期间触发仍会退化成同步解码）。
+    pub(crate) fn submit_front(&self, path: PathBuf) {
+        let mut q = match self.tasks.lock() {
+            Ok(q) => q,
+            Err(_) => return,
+        };
+        q.push_front(path);
+        drop(q);
+        self.condvar.notify_one();
+    }
 }
 
 impl Drop for DecodePool {

@@ -59,6 +59,13 @@ const AUDIO_CACHE_MAX_BYTES: u64 = 256 * 1024 * 1024;
 /// 预加载窗口（秒）：每帧把 `now + 本值` 内的音频交后台解码池。
 const PRELOAD_LOOKAHEAD_SECS: f64 = 10.0;
 
+/// 长音频的文件大小下限：整曲 BGM、长 loop 解码要几百毫秒到秒级，首次触发时
+/// 同步解码会卡住主线程——谱面继续走、音乐却晚开始，之后整曲都错位。
+const LONG_AUDIO_MIN_BYTES: u64 = 400 * 1024;
+
+/// 长音频的额外预加载提前量（秒）：解码耗时才来得及被后台池追上。
+const LONG_AUDIO_LOOKAHEAD_SECS: f64 = 30.0;
+
 /// BGM 走流式解码的文件大小下限；更小的采样走静态缓存多路并发，避免停旧流
 /// 重开导致背景音被掐断。
 const STREAMING_MIN_BYTES: u64 = 2_000_000;
@@ -147,6 +154,8 @@ pub struct AudioManager {
     preload_timeline: Vec<(f64, PathBuf)>,
     /// 时间线游标：下一个待提交解码的下标（滚动窗口推进）。
     preload_idx: usize,
+    /// 已提交后台解码、结果尚未收拢的路径（防止同一文件重复排队）。
+    inflight: HashSet<PathBuf>,
     /// 全局音量（0.0–1.0，线性 → main track 的 dB 音量）。
     volume: f32,
     /// 键音轨上正在播放的声音实例（静态或流式），
@@ -208,6 +217,7 @@ impl AudioManager {
             ready_rx: Mutex::new(ready_rx),
             preload_timeline: Vec::new(),
             preload_idx: 0,
+            inflight: HashSet::new(),
             volume: 1.0,
             keysound_voices: Vec::new(),
             keysound_limiter: KeysoundLimiter::default(),
@@ -283,16 +293,44 @@ impl AudioManager {
     ///
     /// 整体替换上一张谱面的时间线并重置游标——旧谱面残留路径不会再被提交解码。
     pub fn set_preload_timeline(&mut self, timeline: Vec<(f64, PathBuf)>) {
+        self.cache.first_trigger = timeline.iter().map(|(t, p)| (p.clone(), *t)).collect();
+        self.cache.now_secs = 0.0;
         self.preload_timeline = timeline;
         self.preload_idx = 0;
     }
 
+    /// 谱面加载时预解码长音频（整曲 BGM、长 loop 采样）：只排队，不阻塞加载。
+    ///
+    /// 这类文件首次触发时同步解码要几百毫秒到秒级——换段处（两段整曲 BGM 交接）
+    /// 主线程被卡住，谱面继续走而音乐晚开始，之后整曲都错位。提前交给后台池并
+    /// 插队解码 + 标记 pinned（不被 LRU 淘汰），返回提交数量。
+    pub fn prewarm_long_audio(&mut self, paths: impl IntoIterator<Item = PathBuf>) -> usize {
+        let mut submitted = 0usize;
+        for path in paths {
+            if !is_long_audio(&path)
+                || !self.should_cache(&path)
+                || self.cache.get(&path).is_some()
+                || !self.inflight.insert(path.clone())
+            {
+                continue;
+            }
+            self.cache.mark_priority(&path);
+            self.pool.submit_front(path);
+            submitted += 1;
+        }
+        if submitted > 0 {
+            debug!("[audio] 长音频预解码: {submitted} 个（插队）");
+        }
+        submitted
+    }
+
     /// 推进预加载窗口（每帧调用）：把 `now_sec + PRELOAD_LOOKAHEAD_SECS` 之内
-    /// 尚未缓存的音频交后台解码池。
+    /// 尚未缓存的音频交后台解码池（长音频额外提前 [`LONG_AUDIO_LOOKAHEAD_SECS`] 秒）。
     ///
     /// 同时缓存/在途的文件数只与窗口内事件数相关，配合 [`AUDIO_CACHE_MAX_BYTES`]
     /// 淘汰，内存占用与谱面音频总量解耦。
     pub fn pump_preload(&mut self, now_sec: f64) {
+        self.cache.now_secs = now_sec;
         let due = due_preload_paths(
             &self.preload_timeline,
             &mut self.preload_idx,
@@ -303,6 +341,9 @@ impl AudioManager {
         for path in due {
             if !self.should_cache(&path) || self.cache.get(&path).is_some() {
                 continue; // 流式 BGM 不走缓存；已缓存（首批/此前窗口）无需重复解码
+            }
+            if !self.inflight.insert(path.clone()) {
+                continue; // 已在后台队列（预解码或上一窗口提交过）
             }
             self.pool.submit(path);
             submitted += 1;
@@ -324,6 +365,7 @@ impl AudioManager {
         }
         drop(rx);
         for (path, data) in items {
+            self.inflight.remove(&path);
             match data {
                 Some(data) => self.cache.insert_ready(path, data),
                 // 解码失败：从待加载集合移除，避免永久等待
@@ -359,6 +401,7 @@ impl AudioManager {
         // 的残留路径在下一场被重复解码）。
         self.preload_timeline.clear();
         self.preload_idx = 0;
+        self.inflight.clear();
         // 铺面作用域的 BGM 角色缓存/时长同样作废（下一场重新判定）
         self.bgm_roles.clear();
         self.song_total_secs = 0.0;
@@ -404,6 +447,10 @@ impl AudioManager {
                 }
                 None => match StaticSoundData::from_file(path) {
                     Ok(data) => {
+                        debug!(
+                            "[audio] 键音同步解码（未预加载）{}",
+                            path.file_name().unwrap_or_default().to_string_lossy()
+                        );
                         self.cache.insert_ready(path.to_path_buf(), data.clone());
                         data
                     }
@@ -516,6 +563,11 @@ impl AudioManager {
             Some(data) => data.clone(),
             None => match StaticSoundData::from_file(path) {
                 Ok(data) => {
+                    // 预加载窗口没兜住（或已被淘汰）：换段处的同步解码会让音乐晚起
+                    debug!(
+                        "[audio] BGM 同步解码（未预加载）{}",
+                        path.file_name().unwrap_or_default().to_string_lossy()
+                    );
                     self.cache.insert_ready(path.to_path_buf(), data.clone());
                     data
                 }
@@ -910,16 +962,27 @@ fn due_preload_paths(
     now_sec: f64,
     lookahead: f64,
 ) -> Vec<PathBuf> {
-    let deadline = now_sec + lookahead;
     let mut due = Vec::new();
     while let Some((t, path)) = timeline.get(*idx) {
-        if *t > deadline {
+        // 长文件解码成本高：提前量不足就会在其首次触发时退化成同步解码
+        let lead = if is_long_audio(path) {
+            LONG_AUDIO_LOOKAHEAD_SECS
+        } else {
+            0.0
+        };
+        if *t > now_sec + lookahead + lead {
             break;
         }
         due.push(path.clone());
         *idx += 1;
     }
     due
+}
+
+/// 是否为长音频（文件大小 ≥ [`LONG_AUDIO_MIN_BYTES`]）：解码耗时以百毫秒计，
+/// 必须提前提交后台池，不能等到首次触发时同步解码。
+fn is_long_audio(path: &Path) -> bool {
+    std::fs::metadata(path).is_ok_and(|meta| meta.len() >= LONG_AUDIO_MIN_BYTES)
 }
 
 /// BGM 事件的处理动作（纯逻辑，可单测）。
@@ -992,6 +1055,10 @@ struct AudioCache {
     requested: HashSet<PathBuf>,
     /// 首批（开玩必需）路径集合：就绪即视为可开始游玩。
     priority_set: HashSet<PathBuf>,
+    /// 首次触发时间（秒）：预加载时间线的副本，用于淘汰时保住"还没播到"的项。
+    first_trigger: HashMap<PathBuf, f64>,
+    /// 谱面播放位置（秒）：由 [`AudioManager::pump_preload`] 每帧更新。
+    now_secs: f64,
 }
 
 impl AudioCache {
@@ -1050,8 +1117,13 @@ impl AudioCache {
         self.priority_set.insert(path.to_path_buf());
     }
 
-    fn get(&self, path: &Path) -> Option<StaticSoundData> {
-        self.cache.get(path).cloned()
+    fn get(&mut self, path: &Path) -> Option<StaticSoundData> {
+        let data = self.cache.get(path)?.clone();
+        // 命中即刷新使用顺序：反复触发的采样（鼓、镲）不该比冷门长音更早被淘汰，
+        // 否则每次触发都退化成同步解码
+        self.lru.retain(|p| p != path);
+        self.lru.push(path.to_path_buf());
+        Some(data)
     }
 
     /// 首批是否全部就绪（就绪即可开始游玩）。
@@ -1082,11 +1154,21 @@ impl AudioCache {
             if !over_count && !over_bytes {
                 return;
             }
-            let Some(pos) = self
+            // 优先淘汰"已经播过"的项；还没播到的（首触发在当前位置之后）尽量保住，
+            // 否则下一次触发只能同步解码
+            let pos = self
                 .lru
                 .iter()
-                .position(|p| !self.priority_set.contains(p))
-            else {
+                .position(|p| {
+                    !self.priority_set.contains(p)
+                        && self.first_trigger.get(p).is_none_or(|t| *t <= self.now_secs)
+                })
+                .or_else(|| {
+                    self.lru
+                        .iter()
+                        .position(|p| !self.priority_set.contains(p))
+                });
+            let Some(pos) = pos else {
                 return; // 全部首批项：无法再压（首批量本身很小）
             };
             let victim = self.lru.remove(pos);

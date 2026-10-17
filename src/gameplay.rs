@@ -145,7 +145,11 @@ pub(crate) fn setup_gameplay(
     // 向全局音频管理器请求加载：大 BGM 注册为流式（不缓存），其余（键音 +
     // 密集 BGM 采样）同步解码进缓存。注意：register_bgm 必须在 submit_priority
     // 之前（优先级加载会跳过流式 BGM 文件）
-    audio.register_bgm(loaded.bgm_audio_stats());
+    let bgm_stats = loaded.bgm_audio_stats();
+    // 长 BGM（整曲/长 loop）提前插队解码：它们首次触发时同步解码会卡住主线程，
+    // 换段处（两段整曲 BGM 交接）音乐晚起 → 之后整曲与谱面错位
+    audio.prewarm_long_audio(bgm_stats.keys().cloned().collect::<Vec<_>>());
+    audio.register_bgm(bgm_stats);
     let paths: Vec<_> = loaded.wav_paths.values().cloned().collect();
     // 音频租约登记到统一资源管理器（退出时统一释放）
     resource_manager.acquire_audio(audio.acquire(&paths));
@@ -154,7 +158,9 @@ pub(crate) fn setup_gameplay(
         bga_images: loaded.bga.images.len(),
         bga_videos: loaded.bga.videos.len(),
     });
-    let priority = loaded.priority_audio_paths(30.0);
+    // 首批只同步解码开局几秒：30 秒窗口会把 200+ 个采样（数百 MB）钉死在缓存里，
+    // 之后滚动预加载与它抢内存，长 BGM 被淘汰后只能同步解码 → 换段处音乐晚起。
+    let priority = loaded.priority_audio_paths(5.0);
     audio.submit_priority(priority.clone());
     // 预加载时间线：其余音频不一次性全解（内存 = 全谱面采样之和），
     // 改为按谱面时间滚动窗口（`pump_preload`，每帧推进）。
@@ -162,7 +168,7 @@ pub(crate) fn setup_gameplay(
     audio.set_preload_timeline(loaded.audio_timeline());
     audio.pump_preload(0.0);
     info!(
-        "[gameplay] 首批音频 {}/{}（前 30 秒，解码完成即开玩；其余 +/-10s 窗口预加载）",
+        "[gameplay] 首批音频 {}/{}（前 5 秒，解码完成即开玩；其余 +/-10s 窗口预加载）",
         priority.len(),
         paths.len()
     );
